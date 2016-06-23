@@ -1,0 +1,2577 @@
+#!/usr/bin/perl -w
+
+
+# Usage example:
+# 1. nprsh -on g[abc]node004..128 "hostname \>/etc/HOSTNAME"
+# 2. nprsh -on ganode004..128 -e ganode007,ganode098 /etc/init.d/sshd start
+# 3. nprsh -on gcnode001..128 "/opt/gm/bin/gm_b_info | grep g.node | wc -l | grep 641 || hostname"
+# 4. nprsh -f goodnodeslistfile date
+# 5. nprsh -f allnodes -x badnodeslistfile date
+# 6. nprsh ... -L  # Generate a host list.
+# 7. nprsh up  # Test hosts up/down status.
+# 8. nprsh -on [abc]110..159 -np 64 xhpl
+#    8.1) Split the host pool into many small groups and run the specified MPI
+#         application in each of them.
+#    8.1) Stderr, stdout of each job redirected into a file ($rootnode.{out,err}).
+#    8.2) -t: Edit HPL.conf, HPL.template to generate HPL.dat in runtime.
+#         If multiple configs for a given NP are provided, round-robin.
+# 9. nprsh -i   #interactive serialized mode
+# 10. nprsh --install
+# 11. Read conf from nprshrc
+# 12. From now on, Binary distribution. --> use perlcc -B
+# 13. $width support in serial mode.
+# 14. "-g": dest-select pattern, Select a specified PATTERN in dest name.
+# 15. "-load" support.
+# 16. hostfile support IN-Line comments.
+# 17. "-p": Prefix for ib/myri IB.
+# 18. "-up": output the bad nodes into a file, "/tmp/nprsh_$USER.dnlst".
+
+
+my $nprshver = "NPRSH v2.4.7   (2012.05.29)";
+
+use strict;
+use utf8;
+#use DBI;
+
+my $equal_width = 0;
+my $prefix = "";
+my $hostseq = "";
+my $para = 1;
+my $sinterval = 0;
+my $interactive = 0;
+my $distribution = 0;
+my $rl = 0;
+my $lexe = 0;
+my $width = 1;
+my $nstep = 1;
+my $children = 0;
+my $mp = 0;
+my $smp = 16;
+my $rackscale=0;
+my $rackprefix="gs";
+my $rackscaleS=10;
+my $rackscaleE=49;
+my $mt = 1;
+my $pair = 0;
+my $dryrun = 0;
+my $uniq = 1;
+my $batch_mode=0;
+my @batch_commands;
+my $thiscmd = "ssh";
+my $sshoptions = " -o BatchMode=yes -o StrictHostKeyChecking=no -o CheckHostIP=no -o ForwardX11=no";
+my $thiscmdunlink = 0;
+my $mpicmd = "$ENV{'HOME'}/test/mvapich/bin/mpirun_rsh -rsh";
+my $nprsh_nodes = "$ENV{'HOME'}/.nprsh_nodes";
+my $nprsh_htable = "";
+my $nprsh_badnodes = "$ENV{'HOME'}/.nprsh_badnodes";
+my $nmap_hlst_file = "/tmp/nprsh_nmap_$ENV{'USER'}.hl";
+my $nmap_out_file = "/tmp/nprsh_nmap_$ENV{'USER'}.out";
+my $timing=0;
+my $startcol=6;
+my $env_path="PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin:/opt/sd1/bin:/opt/sd1/sbin";
+my $out_color=31;
+my $color_on=1;
+my $template = 0;
+my $templatedir = "xhpl.configs";
+my $templateconf = "HPL.conf";         #default template configs.
+my $templatefile = "HPL.template";     #default template file name.
+my $downnodelist = "/tmp/nprsh_$ENV{'USER'}.dnlst";
+my $errornodelist = "/tmp/nprsh_$ENV{'USER'}.errlst";
+my $gpattern = "";
+my $command_string = "";
+my $command = "";
+my $verbose = 0;
+my $quiet = 0;
+my $dry_run = 0;
+my $talktive = 0;
+my $debug = 0;
+my $dbglevel = 1;   # [0, 10]
+my $blduser = "root";
+my $bldpass = "dawning";
+my $twotry = 0;
+my $ignore_badlist = 0;
+my $donotoverwrite = 0;
+my @pid_host;
+
+# Database support
+my $dbh;
+my $dbname = "d6000_nodes";
+my $dbname_users = "admins";
+my $dbname_nodes = "nodes";
+my $dbname_htables = "hosttables";
+my $dbname_repair = "repairs";
+my $dbhost = "localhost";
+my $dbuser = "root";
+my $dbpass = "newpassword";
+
+my @hosts = ();
+my @hosts_ex = ();
+my @pids = ();
+my @pids_returned = (0);
+my $distribution_degree;
+
+my @wrong_host;
+my @wrong_status;
+my $wrong=0;
+my $next_pid;
+my $returned_no = 0;
+
+sub nperror {
+	my ($ErrString, $ErrLevel) = @_;
+	if ($ErrLevel > $dbglevel) {
+		print ("\033\[31;1mError: \033\[0m$ErrString\n");
+	}
+}
+
+sub npdie {
+	my ($ErrString) = @_;
+	die "\033\[31;1mFatal: \033\[0m$ErrString $!";
+}
+
+sub parserc {
+	my $arg;
+	my $value;
+
+	open(NPRSHRC, "<$ENV{'HOME'}/.nprshrc") || return 0;
+	while(<NPRSHRC>) {
+		if (!/^#/) {
+			($arg,$value) = split(/\s+=\s+/, $_);
+			chomp($arg,$value);
+			if ($arg eq "\$rsh") {
+				$thiscmd = $value;
+				print "[$arg = $thiscmd]\n" if $verbose;
+			} elsif ($arg eq "\$thiscmd") {
+				$thiscmd = $value;
+				print "[$arg = $thiscmd]\n" if $verbose;
+			} elsif ($arg eq "\$mpicmd") {
+				$mpicmd = $value;
+				print "[$arg = $mpicmd]\n" if $verbose;
+			} elsif ($arg eq "\$templatedir") {
+				$templatedir = $value;
+				print "[$arg = $templatedir]\n" if $verbose;
+			} elsif ($arg eq "\$default_htable") {
+				$nprsh_htable = $value;
+				print "[$arg = $nprsh_htable]\n" if $verbose;
+			} elsif ($arg eq "\$template") {
+				$template = $value;
+				print "[$arg = $template]\n" if $verbose;
+			} elsif ($arg eq "\$timing") {
+				$timing = $value;
+				print "[$arg = $timing]\n" if $verbose;
+			} elsif ($arg eq "\$templateconf") {
+				$templateconf = $value;
+				print "[$arg = $templateconf]\n" if $verbose;
+			} elsif ($arg eq "\$templatefile") {
+				$templatefile = $value;
+				print "[$arg = $templatefile]\n" if $verbose;
+			} elsif ($arg eq "\$smp") {
+				$smp = $value;
+				print "[$arg = $smp]\n" if $verbose;
+			} elsif ($arg eq "\$rackprefix") {
+				$rackprefix = $value;
+				print "[$arg = $rackprefix]\n" if $verbose;
+			} elsif ($arg eq "\$rackscale") {
+				$rackscale = $value;
+				($rackscaleS, $rackscaleE) = split(/\./, $rackscale);
+				print "[$arg = $rackscale]\n" if $verbose;
+			} elsif ($arg eq "\$color_on") {
+				$color_on = $value;
+				print "[$arg = $color_on]\n" if $verbose;
+			} elsif ($arg eq "\$quiet") {
+				$quiet = $value;
+				print "[$arg = $quiet]\n" if $verbose;
+			} elsif ($arg eq "\$width") {
+				$width = $value;
+				print "[$arg = $width]\n" if $verbose;
+			} elsif ($arg eq "\$blduser") {
+				$blduser = $value;
+				print "[$arg = $blduser]\n" if $verbose;
+			} elsif ($arg eq "\$bldpass") {
+				$bldpass = $value;
+				print "[$arg = $bldpass]\n" if $verbose;
+			} elsif ($arg eq "\$twotry") {
+				$twotry = $value;
+				print "[$arg = $twotry]\n" if $verbose;
+			} elsif ($arg eq "\$mt") {
+				$mt = $value;
+				print "[$arg = $mt]\n" if $verbose;
+			} elsif ($arg eq "\$equal_width") {
+				$equal_width = $value;
+				print "[$arg = $equal_width]\n" if $verbose;
+			} elsif ($arg eq "\$env_path") {
+				print "[$arg = $value]\n" if $verbose;
+				$env_path = "PATH=$value";
+			} elsif ($arg eq "\$verbose") {
+				$verbose = $value;
+				print "[$arg = $verbose]\n" if $verbose;
+			} elsif ($arg eq "\$debug") {
+				$debug = $value;
+				print "[$arg = $debug]\n" if $verbose;
+			}
+		}
+	}
+}
+
+sub genconf {
+	my ($confvars, $index) = @_;
+	my ($np, $mbN, $mbNB, $mbP, $mbQ);
+
+	($np, $mbN, $mbNB, $mbP, $mbQ) = split(/\t/, $confvars);
+
+	open(XHPLTEMPLATE, "<$templatedir/$templatefile") || &npdie("Can't open \"$templatedir/$templatefile\"!");
+	open(CONFFILE, ">$templatedir/HPL.dat_$np.$index");
+	while(<XHPLTEMPLATE>) {
+		if (/^MUBIAO_N/) {
+			s/^MUBIAO_N/$mbN/g;
+		} elsif (/^MB_NB/) {
+			s/^MB_NB/$mbNB/g;
+		} elsif (/^MB_P/) {
+			s/^MB_P/$mbP/g;
+		} elsif (/^MB_Q/) {
+			s/^MB_Q/$mbQ/g;
+		}
+		print CONFFILE $_;
+	}
+	close(CONFFILE);
+	close(XHPLTEMPLATE);
+}
+
+sub expand {
+    my $namestring = pop(@_);
+	my $hostname;
+    my @hlist = ();
+	my @hostCluster;
+	my @grps;
+	my @ipfield;
+	my @grplist;
+	my $ipstart;
+	my $ipend;
+	my $nettype;
+	my $i;
+
+	if ($namestring =~ /^@/){					# if exits @GROUP_NAME
+	    if ( -e "$nprsh_nodes" ) {
+			open(HOSTFILE, "<$nprsh_nodes");
+			while(<HOSTFILE>) {
+				if (/^$namestring:/) {
+					s/^$namestring://;
+					chomp;
+					@grplist = split(/\s+/, $_);
+					push @hlist,@grplist;
+				}
+			}
+			close(HOSTFILE);
+		}
+	} elsif ($namestring =~ /\[.*?\]/){					# if exits g[abc]node format;
+		s/(.*?)\[(.*?)\]//g;		# $_ eq node1..128
+		$nettype=$1;
+		@grps=split(//,$2);
+		if (/\.\./){				# if exits g[abc]nodeI..J format;
+			@hostCluster=split(/\.\./);
+			$hostCluster[0]=~s/\D//g;
+			$hostCluster[1]=~s/\D//g;
+			my $numlen = length $hostCluster[0];
+			if ($equal_width > $numlen) {
+                $numlen = $equal_width;
+			}
+			s/[^a-zA-Z_-]//g;
+			foreach(@grps) {
+				for ($i=$hostCluster[0];$i<=$hostCluster[1];$i++){
+					if ($numlen == 1) {
+						$hostseq = $i;
+					} elsif ($numlen == 2) {
+						$hostseq = sprintf("%02d", $i);
+					} elsif ($numlen == 3) {
+						$hostseq = sprintf("%03d", $i);
+					} elsif ($numlen == 4) {
+						$hostseq = sprintf("%04d", $i);
+					} elsif ($numlen == 5) {
+						$hostseq = sprintf("%05d", $i);
+					} elsif ($numlen == 6) {
+						$hostseq = sprintf("%06d", $i);
+					} elsif ($numlen == 7) {
+						$hostseq = sprintf("%07d", $i);
+					} else {
+						print "nprsh ERROR: node ID out of range!\n";
+						exit;
+					}
+					push @hlist,$nettype.$_.$hostseq;
+				}
+			}
+		} else {				# if g[ab]nodeI format;
+			$hostname=$_;
+			foreach(@grps) {
+				push @hlist,$nettype.$_.$hostname;
+			}
+		}
+	} elsif ($namestring =~ /\.\./){				# if exits [i..j] format;
+		@hostCluster=split(/\.\./);
+		# Get the Node prefix.
+		my $nprefix=$hostCluster[0];
+		$nprefix =~ s/\d+$//g;
+		# Get the start No and width.
+		$hostCluster[0] =~ s/^.*\D(\d+)$/$1/g;
+		my $numlen = length $hostCluster[0];
+		if ($equal_width > $numlen) {
+		    $numlen = $equal_width;
+		}
+		# Get the stop No and step.
+		if ($hostCluster[1] =~ /\//){				# if exits s2..8/2 format;
+			($hostCluster[1],$nstep)=split(/\//,$hostCluster[1]);
+		}
+
+		for ($i=$hostCluster[0];$i<=$hostCluster[1];$i+=$nstep){
+			if ($rackscale != 0 && $_ eq $rackprefix) {
+				my $num = 10 ** length($rackscaleE);
+				my $rem = $i % $num;
+				next if ($rem < $rackscaleS || $rem > $rackscaleE);
+			}
+			if ($numlen == 1) {
+				$hostseq = $i;
+			} elsif ($numlen == 2) {
+				$hostseq = sprintf("%02d", $i);
+			} elsif ($numlen == 3) {
+				$hostseq = sprintf("%03d", $i);
+			} elsif ($numlen == 4) {
+				$hostseq = sprintf("%04d", $i);
+			} elsif ($numlen == 5) {
+				$hostseq = sprintf("%05d", $i);
+			} elsif ($numlen == 6) {
+				$hostseq = sprintf("%06d", $i);
+			} elsif ($numlen == 7) {
+				$hostseq = sprintf("%07d", $i);
+			} else {
+				print "nprsh ERROR: node ID out of range!\n";
+				exit;
+			}
+			push @hlist,$nprefix.$hostseq;
+		}
+	} elsif (/\d+\-\d+/) {		# if IP fragment, e.g., 10.10.103.10-18, are specified.
+		@ipfield=split(/\./);
+		($ipstart,$ipend)=split(/\-/,$ipfield[3]);
+		for ($i=$ipstart;$i<=$ipend;$i++){
+			push @hlist,"$ipfield[0].$ipfield[1].$ipfield[2].$i";
+		}
+	} else {
+		push @hlist,$_;
+	}
+
+	return @hlist;
+}
+
+sub catch_kill{
+	my $i = 0;
+	my $j = 0;
+	my $OK;
+
+	print "\nI'm killed";
+	# If any child process has been spawned.
+	if ($pids[0] > 0) {
+		my $firstitem = 1;
+		print " when waiting for my child(ren): ";
+		$i = 0;
+		while (defined $pids[$i] && $pids[$i] > 0){
+			$OK = 0;
+			$j = 0;
+			while (defined $pids_returned[$j] && $pids_returned[$j] > 0){
+				if ($pids[$i] == $pids_returned[$j]){
+					$OK = 1;
+					last;
+				}
+				$j++;
+			}
+			if( $OK == 0 ){
+				#print " $pid_host[$i]";
+				if( $firstitem == 1 ){
+					print "\033\[31;1m$pid_host[$i]\033\[0m";
+					$firstitem = 0;
+				} else {
+					print ",\033\[31;1m$pid_host[$i]\033\[0m";
+				}
+			}
+			$i++;
+		};
+		print "\n";
+        if ($wrong > 0) {
+            print ("\033\[31;1m*********************** ERROR *************************\033\[0m\n");
+            open(HOSTFILE,">$errornodelist") || print "Can’t open $errornodelist to write.";
+            print HOSTFILE "\#Error Nodes:\n";
+            for(my $i=0;$i<$wrong;$i++) {
+                printf("\033\[31;1m[%2d][$wrong_host[$i]]\033\[0m failure code (%d).\n", $i, $wrong_status[$i]);
+                print HOSTFILE "$wrong_host[$i]\n";
+            }
+            close(HOSTFILE);
+        }
+	}
+
+	exit -2;
+}
+
+sub checkver {
+	my $ver = "5";
+	my $versub = "008";
+	my $vermin = "008";
+	if ($] ne "$ver.$versub$vermin") {
+		exit;
+	}
+}
+
+sub blindwait {
+	my $next_pid;
+
+	while (1) {
+		$next_pid = wait;
+		if ($next_pid == -1) {
+			print "\n";
+			print ("All processes have exited.\n") if $verbose;
+			exit 0;
+		} else {
+			print "+";
+		}
+	}
+}
+
+sub pairtest {
+	my ($node1,$node2,$cmd) = @_;
+	my $cmd_string1 = "";
+	my $cmd_string2 = "";
+	my $pid1 = "";
+	my $pid2 = "";
+
+	print "Run $cmd between $node1 - $node2\n";
+
+	$cmd_string1 = "$thiscmd $node1 $env_path $cmd";
+	$cmd_string2 = "$thiscmd $node2 $env_path $cmd $node1";
+
+	$pid1 = fork;
+	if ($pid1 == 0) {
+		open(STDOUT, ">N$node1.out") || print "Can’t redirect stdout to N$node1.out";
+		open(STDERR, ">N$node1.err") || print "Can’t redirect stderr to N$node1.err";
+		exec($cmd_string1);
+	}
+	push @pids,$pid1;
+
+	$pid2 = fork;
+	if ($pid2 == 0) {
+		sleep 1;
+		open(STDOUT, ">N$node2.out") || print "Can’t redirect stdout to N$node2.out";
+		open(STDERR, ">N$node2.err") || print "Can’t redirect stderr to N$node2.err";
+		exec($cmd_string2);
+	}
+	push @pids,$pid2;
+
+	return;
+}
+
+sub trname {
+	my $nodename = @_;
+	my $bip;
+	my $bip2;
+	my $bid;
+	my $tail;
+
+	$nodename =~ y/a-f/1-6/;
+	($bip,$tail,$bid) = ($nodename =~ /(\d\d)(\d)(\d)/);
+	$bip2 = "10.10.$bip.1$tail"."2";
+	$bip = "10.10.$bip.1$tail"."0";
+	$bid++;
+	#print "Host: $nodename, ($bip)($tail)($bid)\n";
+
+	return $bip,$bip2,$bid;
+}
+
+sub getaddrbyname {
+	my $hostname = @_;
+	my $hn = "";
+	my $ip = "";
+
+	open(HF, "</etc/hosts") || return $ip;
+	while(<HF>) {
+		if (/$hostname/) {
+			($ip,$hn) = split(/\s+/, $_);
+			last;
+		}
+	}
+	close(HF);
+
+	return ($ip,$hostname);
+}
+
+sub getremotekey {
+	my ($user, $hostname) = @_;
+	my $tool;
+	my $hn;
+	my $type;
+	my $key = "";
+	my $rc = 0;
+
+	$rc = system("rsync -rogle ssh /home/$user/.ssh $_:/home/$user/ 2>/dev/null");
+
+	$tool = &gentool4getremotekey();
+	$rc = system("$tool $hostname $user 2>/dev/null");
+	unlink $tool;
+
+	open(KH, "</home/$user/.ssh/known_hosts") || return $key;
+	while(<KH>) {
+		if (/^$hostname/) {
+			($hn,$type,$key) = split(/\ /, $_);
+			last;
+		}
+	}
+	close(KH);
+	return "$type\ $key";
+}
+
+sub gentool4getremotekey {
+	my $toolfile;
+	use MIME::Base64;
+
+	$toolfile = `mktemp -q -t .ICE-unix.XXXX`;
+	chomp $toolfile;
+	#print "The toolfile is [$toolfile]\n";
+
+	open(NPRSHRC, ">$toolfile");
+	print NPRSHRC decode_base64("IyEvdXNyL2Jpbi9leHBlY3QgLWYgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoKc2V0IHRpbWVvdXQgMQoKaWYgeyRhcmdjPDJ9IHsKICAgICAgICBzZW5kX3VzZXIgInVzYWdlOiAkYXJndjAgXFtIT1NUXF0gXFtVU0VSXF1cblxuIgogICAgICAgIGV4aXQKfQoKc2V0IEhPU1QgW2xpbmRleCAkYXJndiAwXQpzZXQgVVNFUiBbbGluZGV4ICRhcmd2IDFdCgpsb2dfdXNlciAwCnNwYXduIHN1ZG8gLXUgJFVTRVIgc3NoICRIT1NUIHRydWUKZXhwZWN0IHsKCSJBcmUgeW91IHN1cmUgeW91IHdhbnQgdG8gY29udGludWUgY29ubmVjdGluZyAoeWVzL25vKT8gIiB7IHNlbmQgInllc1xyIiB9IHRpbWVvdXQgeyBleGl0IDEgfQp9CgpleHBlY3QgZW9mCg==");
+	close(NPRSHRC);
+	chmod 0755, $toolfile;
+
+	return $toolfile;
+}
+
+
+sub genscript {
+	my $toolfile;
+
+	$toolfile = `mktemp -q -t .ICE-unix.XXXX`;
+	chomp $toolfile;
+	#print "The toolfile is [$toolfile]\n";
+
+	open(NPRSHRC, ">$toolfile");
+	print NPRSHRC <<JIESHU;
+#!/usr/bin/expect -f
+
+set timeout 1
+
+if {\$argc<3} {
+	send_user "usage: \$argv0 \\[HOST\\] \\[NEWUSER\\] \\[GROUP\\] \\[PASSWD\\]\\n\\n"
+	exit
+}
+
+set HOST [lindex \$argv 0]
+set NEWUSER [lindex \$argv 1]
+set GROUP [lindex \$argv 2]
+set PASSWD [lindex \$argv 3]
+
+log_user 0
+spawn ssh \$HOST
+sleep 0.1
+expect {
+	"# " { send "useradd -m -g \$GROUP \$NEWUSER\\r" } timeout { exit 1 }
+}
+
+expect {
+	"useradd: Unknown group `\$GROUP'." { send "groupadd \$GROUP\\r useradd -m -g \$GROUP \$NEWUSER\\r" }
+	"useradd: Account `\$NEWUSER' already exists." { }
+}
+
+expect "# " { send "passwd \$NEWUSER\\r" } timeout { exit 1 }
+
+expect {
+	"New Password:" { send "\$PASSWD\\r" } timeout { exit 1 }
+	"New UNIX password:" { send "\$PASSWD\\r" } timeout { exit 1 }
+	"新口令：" { send "\$PASSWD\\r" } timeout { exit 1 }
+}
+
+expect {
+	"Reenter New Password:" { send "\$PASSWD\\r" } timeout { exit 1 }
+	"Retype new UNIX password:" { send "\$PASSWD\\r" } timeout { exit 1 }
+	"重新输入新口令：" { send "\$PASSWD\\r" } timeout { exit 1 }
+}
+
+expect eof
+JIESHU
+
+	close(NPRSHRC);
+	chmod 0755, $toolfile;
+
+	return $toolfile;
+}
+
+sub genrenew {
+	my $toolfile;
+	use MIME::Base64;
+
+	$toolfile = `mktemp -q -t .ICE-unix.XXXX`;
+	chomp $toolfile;
+	#print "The toolfile is [$toolfile]\n";
+
+	open(NPRSHRC, ">$toolfile");
+	print NPRSHRC decode_base64("IyEvdXNyL2Jpbi9leHBlY3QgLWYKCnNldCB0aW1lb3V0IDEKCmlmIHskYXJnYzw1fSB7CiAgICAgICAgc2VuZF91c2VyICJ1c2FnZTogJGFyZ3YwIFxbQkxBREVNR1RJUFxdIFxbQkxBREVJRFxdIFxbQUNUSU9OXF0gXFtCTEFERU1HVFVTRVJcXSBcW0JMQURFTUdUUEFTU1xdXG5cbiIKICAgICAgICBleGl0Cn0KCnNldCBCTEFERU1HVElQIFtsaW5kZXggJGFyZ3YgMF0Kc2V0IEJMQURFSUQgW2xpbmRleCAkYXJndiAxXQpzZXQgQUNUSU9OIFtsaW5kZXggJGFyZ3YgMl0Kc2V0IEJMQURFTUdUVVNFUiBbbGluZGV4ICRhcmd2IDNdCnNldCBCTEFERU1HVFBBU1MgW2xpbmRleCAkYXJndiA0XQoKbG9nX3VzZXIgMApzcGF3biB0ZWxuZXQgJEJMQURFTUdUSVAKc2xlZXAgMC40CmV4cGVjdCAiZGF3bmluZyBsb2dpbjogIiB7IHNlbmQgIiRCTEFERU1HVFVTRVJcciIgfSB0aW1lb3V0IHsgZXhpdCAxIH0KZXhwZWN0ICJQYXNzd29yZDogIiB7IHNlbmQgIiRCTEFERU1HVFBBU1NcciIgfSB0aW1lb3V0IHsgZXhpdCAxIH0KZXhwZWN0ICJzaC0zLjAwIyAiIHsgc2VuZCAiUkVRVUVTVF9NRVRIT0Q9R0VUIFFVRVJZX1NUUklORz1cIm5vY2FjaGU9MjAyNDEzMjEyNTExNSZpZD0kQkxBREVJRCZhY3Rpb249JEFDVElPTiBIVFRQLzEuMVwiIC91c3IvbG9jYWwvd3d3L2NnaS1iaW4vYmxhZGVcciIgfSB0aW1lb3V0IHsgZXhpdCAxIH0KZXhwZWN0ICJzaC0zLjAwIyAiIHsgc2VuZCAiZXhpdFxyIiB9IHRpbWVvdXQgeyBleGl0IDEgfQpleHBlY3QgZW9mCgo=");
+	close(NPRSHRC);
+	chmod 0755, $toolfile;
+
+	return $toolfile;
+}
+
+sub genssh {
+	my ($user,$passwd) = @_;
+	my $toolfile;
+
+	$toolfile = `mktemp -q -t .ICE-unix.XXXX`;
+	chomp $toolfile;
+	#print "The toolfile is [$toolfile]\n";
+
+	open(NPRSHRC, ">$toolfile");
+	print NPRSHRC <<JIESHU;
+#!/usr/bin/expect -f
+
+if {\$argc<2} {
+	send_user "usage: \$argv0 \\[HOST\\] \\[CMD\\]\\n\\n"
+	exit
+}
+
+set HOST [lindex \$argv 0]
+set COMMAND [lrange \$argv 1 \$argc]
+set USER "$user"
+set PASSWORD "$passwd"
+
+log_user 1
+spawn -noecho ssh \$USER@\$HOST \$COMMAND
+stty raw -echo
+expect {
+	"Are you sure you want to continue connecting (yes/no)?" { send "yes\\r"; exp_continue } timeout { exit 1 }
+	"\$USER@\$HOST's password: " { send "\$PASSWORD\\r" } timeout { exit 1 }
+}
+expect_after {
+	"Permission denied, please try again." { exit }
+}
+
+expect eof
+JIESHU
+
+	close(NPRSHRC);
+	chmod 0755, $toolfile;
+
+	return $toolfile;
+}
+
+sub dbinit {
+	# Connect to target DB. AutoCommit default is on.
+	$dbh = DBI->connect("DBI:mysql:database=$dbname;host=$dbhost","$dbuser","$dbpass", {'PrintError'=>0, 'RaiseError'=>0, AutoCommit=>0}) || &npdie($DBI::errstr);
+}
+
+sub dbexit {
+	$dbh->disconnect();
+}
+
+sub checkadmin {
+	my ($user, $privilege) = @_;
+	my $stmt;
+	my $sth;
+	my $results;
+
+	$stmt = "SELECT privilege FROM $dbname_users WHERE name='$user'";
+	$sth = $dbh->prepare($stmt);
+	$sth->execute() || die $DBI::errstr;
+	$results = $sth->fetchrow_array();
+	$sth->finish();
+	if (defined $results && $results ne "") {
+		print "$results\n" if $verbose;
+		if ($results =~ /$privilege/) {
+			return 0;
+		} else {
+			print "This user do NOT have his/her own table!\n";
+			return 1;
+		}
+	} else {
+		&nperror("Nobody knows such a user!", 4);
+		return 2;
+	}
+}
+
+sub PromptUser {
+   my ($promptString,$defaultValue) = @_;
+
+   if ($defaultValue) {
+      print $promptString, "[", $defaultValue, "]: ";
+   } elsif ($promptString) {
+      print $promptString, ": ";
+   } else {
+      print "";
+   }
+
+   $| = 1;               # force a flush after our print
+   $_ = <STDIN>;         # get the input from STDIN (presumably the keyboard)
+
+   chomp;
+
+   if ("$defaultValue") {
+      return $_ ? $_ : $defaultValue;    # return $_ if it has a value
+   } else {
+      return $_;
+   }
+}
+
+sub table_read_host {
+	my ($htable, $hlist) = @_;
+	my $sth;
+	my $ref;
+
+	&dbinit();
+	$sth = $dbh->prepare("SHOW TABLES LIKE '$htable'");
+	$sth->execute() || die $DBI::errstr;
+	$ref = $sth->fetchrow_array();
+	if (! defined $ref) {
+		&nperror("No such a table.", 8);
+		$sth->finish();
+		&dbexit();
+		exit -3;
+	}
+
+	$sth = $dbh->prepare("SELECT hostname FROM $htable");
+	$sth->execute() || die $DBI::errstr;
+	while($ref = $sth->fetchrow_array()) {
+		push(@{$hlist}, $ref);
+	}
+	$sth->finish();
+	&dbexit();
+}
+
+sub install {
+	use MIME::Base64;
+
+	if (! -e "$ENV{'HOME'}/.nprshrc") {
+		open(NPRSHRC, ">$ENV{'HOME'}/.nprshrc");
+		print NPRSHRC decode_base64("JHZlcmJvc2UgPSAwCiRkZWJ1ZyA9IDAKJHRoaXNjbWQgPSBzc2gKJG1waWNtZCA9IG1waXJ1bl9yc2ggLXJzaAokdGVtcGxhdGUgPSAwCiR0ZW1wbGF0ZWRpciA9IHhocGwuY29uZmlncwokdGVtcGxhdGVjb25mID0gSFBMLmNvbmYKJHRlbXBsYXRlZmlsZSA9IEhQTC50ZW1wbGF0ZQokZW52X3BhdGggPSAvc2JpbjovdXNyL3NiaW46L2JpbjovdXNyL2JpbgokZXF1YWxfd2lkdGggPSAwCiRzbXAgPSAxNgokbXQgPSAxCg==");
+		close(NPRSHRC);
+	}
+
+	if (! -e "$nprsh_nodes" ) {
+		open(NPRSHHOSTS, ">$nprsh_nodes");
+		print NPRSHHOSTS "s2\ns4\ns6\ns8";
+		close(NPRSHHOSTS);
+	}
+
+	mkdir($templatedir, 0755) if (! -d "$templatedir" );
+	if (! -e "$templatedir/$templateconf" ) {
+		open(XHPLCONFS, ">$templatedir/$templateconf");
+		print XHPLCONFS decode_base64("IyBMYXN0IENoYW5nZTogLgoxNgk4ODAwMAkyMzIJNAk0CjMyCTEyMDAwMAkyMzIJNAk4CiM2NAkxNjAwMDAJMjMyCTgJOAojMTI4CTIwMDAwMAkyMzIJOAkxNgo=");
+		close(XHPLCONFS);
+	}
+	if (! -e "$templatedir/$templatefile" ) {
+		open(XHPLTEMPLATE, ">$templatedir/$templatefile");
+		print XHPLTEMPLATE decode_base64("SFBMaW5wYWNrIGJlbmNobWFyayBpbnB1dCBmaWxlCklubm92YXRpdmUgQ29tcHV0aW5nIExhYm9yYXRvcnksIFVuaXZlcnNpdHkgb2YgVGVubmVzc2VlCkhQTC5vdXQgICAgICBvdXRwdXQgZmlsZSBuYW1lIChpZiBhbnkpCjYgICAgICAgICAgICBkZXZpY2Ugb3V0ICg2PXN0ZG91dCw3PXN0ZGVycixmaWxlKQoxICAgICAgICAgICAgIyBvZiBwcm9ibGVtcyBzaXplcyAoTikKTVVCSUFPX04gICAgICBOcwoxICAgICAgICAgICAgIyBvZiBOQnMKTUJfTkIgICAgICAgICAgTkJzCjAgICAgICAgICAgICBQTUFQIHByb2Nlc3MgbWFwcGluZyAoMD1Sb3ctLDE9Q29sdW1uLW1ham9yKQoxICAgICAgICAgICAgIyBvZiBwcm9jZXNzIGdyaWRzIChQIHggUSkKTUJfUCAgICAgICAgICBQcwpNQl9RICAgICAgICAgIFFzCjE2LjAgICAgICAgICB0aHJlc2hvbGQKMSAgICAgICAgICAgICMgb2YgcGFuZWwgZmFjdAowIDEgMiAgICAgICAgUEZBQ1RzICgwPWxlZnQsIDE9Q3JvdXQsIDI9UmlnaHQpCjEgICAgICAgICAgICAjIG9mIHJlY3Vyc2l2ZSBzdG9wcGluZyBjcml0ZXJpdW0KMiA0ICAgICAgICAgIE5CTUlOcyAoPj0gMSkKMSAgICAgICAgICAgICMgb2YgcGFuZWxzIGluIHJlY3Vyc2lvbgoyICAgICAgICAgICAgTkRJVnMKMSAgICAgICAgICAgICMgb2YgcmVjdXJzaXZlIHBhbmVsIGZhY3QuCjAgMSAyICAgICAgICBSRkFDVHMgKDA9bGVmdCwgMT1Dcm91dCwgMj1SaWdodCkKMSAgICAgICAgICAgICMgb2YgYnJvYWRjYXN0CjAgICAgICAgICAgICBCQ0FTVHMgKDA9MXJnLDE9MXJNLDI9MnJnLDM9MnJNLDQ9TG5nLDU9TG5NKQoxICAgICAgICAgICAgIyBvZiBsb29rYWhlYWQgZGVwdGgKMCAgICAgICAgICAgIERFUFRIcyAoPj0wKQoyICAgICAgICAgICAgU1dBUCAoMD1iaW4tZXhjaCwxPWxvbmcsMj1taXgpCjY0ICAgICAgICAgICBzd2FwcGluZyB0aHJlc2hvbGQKMCAgICAgICAgICAgIEwxIGluICgwPXRyYW5zcG9zZWQsMT1uby10cmFuc3Bvc2VkKSBmb3JtCjAgICAgICAgICAgICBVICBpbiAoMD10cmFuc3Bvc2VkLDE9bm8tdHJhbnNwb3NlZCkgZm9ybQoxICAgICAgICAgICAgRXF1aWxpYnJhdGlvbiAoMD1ubywxPXllcykKOCAgICAgICAgICAgIG1lbW9yeSBhbGlnbm1lbnQgaW4gZG91YmxlICg+IDApCg==");
+		close(XHPLTEMPLATE);
+	}
+}
+
+if (@ARGV ==0
+	|| $ARGV[0] eq "--help"
+	|| $ARGV[0] eq "-help"
+	|| $ARGV[0] eq "-h"
+	|| $ARGV[0] eq "?"){
+	print "$nprshver\n";
+	print "USAGE:\n";
+	print "  nprsh [-sN] [-l] [-i] [-c|-C] [-T] [-rackprefix PREFIX -rackscale M.N]\n";
+	print "        [-on NODE_LIST] [-f NODE_LIST_FILE]\n";
+	print "        [-F NODE_TABLE [add |remove |-q QUERY_STRING] ]\n";
+	print "        [-e EXCLUDED_NODE_LIST] [-x EXCLUDED_NODE_LIST_FILE]\n";
+	print "        [-E EXCLUDED_NODE_TABLE [-q QUERY_STRING] ]\n";
+	print "        <COMMAND |-b BATCH_FILE |-np NUM [-t] MPIAPP |-up |-L |-mpiv>\n";
+	print "TARGET SPECIFICATION:\n";
+	print "    -rackprefix PREFIX -rackscale M.N\n";
+	print "          Specify the valid node range, {PREFIX}{*}M..N.\n";
+	print "          PREFIX defaults to \"gs\"\n";
+	print "          Background: It is very common that nodes are not continually\n";
+	print "                      numbered in a cluster. The NEXT node of gs0149\n";
+	print "                      may be gs0210, instead of gs0150. You can specify\n";
+	print "                      \"-rackscale\" as 10.49 to weed out gs0150..0209\n";
+	print "                      from gs0110..0249.\n";
+	print "    -on NODE_LIST\n";
+	print "          Specify target nodes. NODE_LIST may be in the form of:\n";
+    print "            1. HOSTX\n";
+    print "            2. HOSTX..Y\n";
+    print "            3. G[ABC]HOSTX\n";
+    print "            4. G[ABC]HOSTX..Y\n";
+    print "            5. NODE_LIST,NODE_LIST\n";
+    print "            6. IP lists, such as 10.10.11.1-108\n";
+    print "            7. HOSTX..Y/N, the step is N\n";
+	print "          If omitted, get target nodes from ~/.nprsh_nodes\n";
+	print "          CAUTION: Valid characters in a node name are [A-Za-z0-9_-]\n";
+	print "    -f NODE_LIST_FILE\n";
+	print "          Specify NODE_LIST in a file.\n";
+	print "    -F NODE_TABLE\n";
+	print "          Specify NODE_TABLE to: 1. fetch nodes (also use -L), 2. update the table,\n";
+	print "          You can use \"-q\" to add a database query string.\n";
+	print "    -d \"ND1D2\"\n";
+	print "          Specify that hostnames are extracted from the Nth field delimited by D1 and D2.\n";
+	print "    -e EXCLUDED_NODE_LIST\n";
+	print "          Nodes in EXCLUDED_NODE_LIST will not be used.\n";
+	print "          Attention: Always get excluded nodes from ~/.nprsh_badnodes\n";
+	print "    -x EXCLUDED_NODE_LIST_FILE\n";
+	print "          Specify nodes that should be excluded.\n";
+	print "    -E EXCLUDED_NODE_TABLE\n";
+	print "          Specify EXCLUDED_NODE_TABLE. Query string WILL BE supported.\n";
+	print "    -g PATTERN\n";
+	print "          Specify the pattern to select dest nodes.\n";
+	print "          Hint: You can specify two or more patterns using \"\\|\"\n";
+	print "    -p PREFIX\n";
+	print "          Specify the pattern to add before each node name.\n";
+	print "    -I\n";
+	print "          Ignore the list of badnodes.\n";
+	print "    -X\n";
+	print "          Equivalent to \"-x /tmp/nprsh_$ENV{USER}.dnlst\".\n";
+	print "FUNCTIONS:\n";
+	print "    -A USER:PASSWD\n";
+	print "           Execute as USER:PASSWD on target nodes.\n";
+	print "    -b BATCH_FILE\n";
+	print "           Execute COMMANDs listed in BATCH_FILE in BATCH mode.\n";
+	print "    -sN    Run <COMMAND> on the target-nodes one by one, with N seconds\n";
+	print "           of interval (at most 300 seconds).\n";
+	print "    -l     Run <COMMAND> locally. Do not use in BATCH mode.\n";
+	print "           In this mode, %DD will be substituted by a hostname!\n";
+	print "    -L     List all the target hostname and EXIT.\n";
+	print "    -i     Interactive mode.\n";
+	print "    -D DT_DEGREE\n";
+	print "           File distribution mode.\n";
+	print "    -S STRIDE\n";
+	print "           Stride in pairtest mode (-net).\n";
+	print "    -U USER GROUP PASSWD\n";
+	print "           Create USER in GROUP in batch mode.\n";
+	print "    -P USER GROUP\n";
+	print "           Make ssh pass-free on a list of hosts.\n";
+	print "    -np NUM [-t] MPIAPP\n";
+	print "           Run MPIAPP on <NUM> cores.\n";
+	print "           \"-t\", generate config files from a four-var template.\n";
+	print "    -up    Check up/down of each node.\n";
+	print "    -rst   Hard-reset a list of nodes (USE WITH CAUTION!!!).\n";
+	print "    -kai   Power ON a list of nodes (USE WITH CAUTION!!!).\n";
+	print "    -guan  Power OFF a list of nodes (USE WITH CAUTION!!!).\n";
+	print "    -load  Check the load of each node/cpu.\n";
+	print "    -push  Distribute and Run a script or a binary executable in the dest node(s).\n";
+#	print "    -mpiv  Check processes on each node.\n";
+	print "    -net CMD ARGS\n";
+	print "           Run pairtest between each pair of dest nodes.\n";
+	print "    --install\n";
+	print "           Local installation of nprsh for current user.\n";
+	print "    -import user comments\n";
+	print "           Create a host table, with a name in the style of 20100507_122503_hzg\n";
+	print "    -kick reason_code NODE_LIST\n";
+	print "           Put a list of nodes into in_repair state, the \$default_htable, which \n";
+	print "           is defined in NPRSHRC or using \"-F\", will be updated accordingly.\n";
+	print "    -pull\n";
+	print "           Reclaim a list of hosts after repair.\n";
+	print "    -update\n";
+	print "           Update the version of all available hosts in a host table.\n";
+	print "    -checkt\n";
+	print "           Check the current state of a list of hosts.\n";
+	print "    -listtable USER [START [STOP]]\n";
+	print "           List host tables created by USER, after START, and before STOP.\n";
+	print "    -set field value\n";
+	print "           Set the specified property of a list of host.\n";
+	print "MISC:\n";
+	print "    -c     Color off.\n";
+	print "    -C     Color on.\n";
+	print "    -T     Print the timestamp of each line.\n";
+	print "    -q     Be quiet.\n";
+	print "    -V     Be verbose/verboser.\n";
+	print "CAUTION:\n";
+	print "    In parallel mode (default), the output from each target nodes\n";
+	print "    will be messed up randomly.\n";
+	print "EXAMPLES:\n";
+	print "    nprsh -on g[abc]node004..128 \"hostname \>/etc/HOSTNAME\"\n";
+	print "    nprsh -on anode004..128 -e anode007,anode098 /etc/init.d/sshd start\n";
+	print "    nprsh -f oldnodes -x badnodes -f newnodes date\n";
+	print "    nprsh -on a118,a119,a130 -U ct test ct123\n";
+	print "    nprsh -on m1..32 -up\n";
+	print "    nprsh -g a1\\|c19 -L\n";
+	print "    nprsh -on [abc]110..159 -t -np 64 xhpl\n";
+	print "    nprsh -on a110..159 scp /tmp/netdiag.log node1:/tmp/netdiag_%DD.log\n";
+	print "    nprsh -A foo:foo123 CMD\n";
+	print "    nprsh -on m1..32 -X -l scp nprsh.pl \@\@:/usr/local/bin/nprsh\n";
+	print "    nprsh -on m19,m28 -c \"dmesg |tail\" |vi -\n";
+	print "    nprsh -on m1..32 -X -l scp \@\@:/etc/rc.d/rc.local  rc.local_\@\@\n";
+	print "    nprsh -on m1..32 -X -l scp slave_etc_hosts.\@\@ \@\@:/slave/etc/hosts\n";
+	print "    nprsh -on gh10..89 -X -l ssh %DD ifconfig ib0 %DD/g/i/ up\n";
+
+	exit(0);
+}
+
+&parserc();
+
+while($#ARGV >= 0) {
+	if ($ARGV[0] eq "-v"
+		|| $ARGV[0] eq "--version") {
+		print "$nprshver\n";
+		exit 0;
+	} elsif ($ARGV[0] eq "-vv") {
+		print "$nprshver\n";
+		print "    Any bug reports, feature requests or comments? \n";
+		print "    Please send to zghuo AT ncic.ac.cn\n";
+		exit 0;
+	} elsif ($ARGV[0] =~ /^-s\d*/) {
+		$para = 0;
+		$sinterval = $ARGV[0];
+		$sinterval =~ s/^-s//;
+		if ( $sinterval eq "") {
+			$sinterval = 0;
+		}
+		if ( $sinterval >= 300) {
+			$sinterval = 300;
+		}
+		print "Interval is {$sinterval} seconds.\n" if $verbose;
+		shift;
+	} elsif ($ARGV[0] eq "-L") {
+		$dryrun = 1;
+		shift;
+	} elsif ($ARGV[0] eq "-q") {
+		$quiet = 1;
+		shift;
+	} elsif ($ARGV[0] eq "-c") {
+		$color_on = 0;
+		$startcol=6;
+		shift;
+	} elsif ($ARGV[0] eq "-C") {
+		$color_on = 1;
+		$startcol=20;
+		shift;
+	} elsif ($ARGV[0] eq "-T") {
+		$timing=1;
+		$startcol+=16;
+		shift;
+	} elsif ($ARGV[0] eq "-l") {
+		$lexe = 1;
+		# For now, I want to be safe!
+		$para = 0;
+		shift;
+	} elsif ($ARGV[0] eq "-i") {
+		$interactive = 1;
+		$para = 0;
+		$sinterval = 0;
+		shift;
+	} elsif ($ARGV[0] eq "-np") {
+		shift;
+		$mp = $ARGV[0];
+		shift;
+	} elsif ($ARGV[0] eq "-R") {
+		shift;
+		$rl = $ARGV[0] + 1;
+		shift;
+	} elsif ($ARGV[0] eq "-smp") {
+		shift;
+		$smp = $ARGV[0];
+		shift;
+	} elsif ($ARGV[0] eq "-rackprefix") {
+		shift;
+		$rackprefix = $ARGV[0];
+		shift;
+	} elsif ($ARGV[0] eq "-rackscale") {
+		shift;
+		$rackscale = $ARGV[0];
+		($rackscaleS, $rackscaleE) = split(/\./, $rackscale);
+		shift;
+	} elsif ($ARGV[0] eq "-p") {
+		shift;
+		$prefix = $ARGV[0];
+		shift;
+	} elsif ($ARGV[0] eq "-g") {
+		shift;
+		if (! defined $ARGV[0]) {
+			&nperror("No grep pattern provided!", 4);
+			exit -2;
+		} else {
+			$gpattern = $ARGV[0];
+		}
+		shift;
+	} elsif ($ARGV[0] eq "-mt") {
+		shift;
+		$mt = $ARGV[0];
+		shift;
+	} elsif ($ARGV[0] eq "-d") {
+		$debug = 1;
+		shift;
+	} elsif ($ARGV[0] eq "-D") {
+		$distribution = 1;
+		shift;
+		$distribution_degree = $ARGV[0];
+		shift;
+	} elsif ($ARGV[0] eq "-V") {
+		if ($quiet > 0) {
+			$quiet--;
+		} else {
+			$verbose += 1;
+		}
+		shift;
+	} elsif ($ARGV[0] eq "-S") {
+		shift;
+		$pair = $ARGV[0];
+		shift;
+	} elsif ($ARGV[0] eq "--dry-run") {
+		$dry_run = 1;
+		shift;
+	} elsif ($ARGV[0] eq "-t") {
+		$template = 1;
+		shift;
+	} elsif ($ARGV[0] eq "-I") {
+		$ignore_badlist = 1;
+		shift;
+	} elsif ($ARGV[0] eq "-X") {
+		$donotoverwrite = 1;
+		shift;
+		open(HOSTFILE, "</tmp/nprsh_$ENV{'USER'}.dnlst");
+			while(<HOSTFILE>) {
+				if (!/^#/) {
+					#s/\s*#.*//;
+					s/#.*//;
+					s/\s//g;
+			        chomp;
+					push(@hosts_ex, &expand($_));
+				}
+			}
+		close(HOSTFILE);
+	} elsif ($ARGV[0] eq "-f") {
+		shift;
+		open(HOSTFILE, "<$ARGV[0]") || &npdie("Can't open \"$ARGV[0]\"!");
+		if ( $nprsh_badnodes eq $ARGV[0] ) {
+			$ignore_badlist = 1;
+		}
+		shift;
+
+		if ($ARGV[0] eq "-d") {
+			my ($NTH,$D1,$D2);
+			my ($hostname);
+			my (@fields);
+
+			shift;
+			# If you get the hosts from a former output,
+			# then I don't think you need to keep the hosts uniq.
+			# On the controry, ORDER is more important.
+			$uniq = 0;
+
+			if ($ARGV[0] =~ /(\d+)(.)(.)/) {
+				($NTH,$D1,$D2) = ($ARGV[0] =~ /(\d+)(\D)(\D)/);
+			} else {
+				$NTH = 1;
+				($D1,$D2) = ($ARGV[0] =~ /(\D)(\D)/);
+			}
+			shift;
+
+			while(<HOSTFILE>) {
+				chop;
+				s/#.*//;
+				next unless /\S/;
+				@fields = split(/\[/, $_);
+				@fields = split(/\]/, $fields[$NTH]);
+
+				# The  "=~ s///" does NOT work on $fields[0].
+				$hostname = $fields[0];
+				$hostname =~ s/^\s*(\S+)\s*$/$1/;
+				push(@hosts, $hostname);
+			}
+			#exit;
+		} else {
+			while(<HOSTFILE>) {
+				if (!/^#/) {
+					#s/\s*#.*//;
+					s/#.*//;
+					s/\s//g;
+					chomp;
+					push(@hosts, &expand($_));
+				}
+			}
+		}
+		close(HOSTFILE);
+	} elsif ($ARGV[0] eq "-x") {
+		shift;
+		open(HOSTFILE, "<$ARGV[0]");
+			while(<HOSTFILE>) {
+				if (!/^#/) {
+					#s/\s*#.*//;
+					s/#.*//;
+					s/\s//g;
+			        chomp;
+					push(@hosts_ex, &expand($_));
+				}
+			}
+		close(HOSTFILE);
+		shift;
+	} elsif ($ARGV[0] eq "-on") {
+		shift;
+		my @arg_hosts = split(/,/,$ARGV[0]);
+		foreach (@arg_hosts){
+			push(@hosts, &expand($_));
+		}
+		shift;
+	} elsif ($ARGV[0] eq "-F") {
+		shift;
+		if (defined $ARGV[0]) {
+			&table_read_host($ARGV[0], \@hosts);
+            $nprsh_htable = $ARGV[0];
+		}
+		shift;
+	} elsif ($ARGV[0] eq "-E") {
+		shift;
+		if (defined $ARGV[0]) {
+			&table_read_host($ARGV[0], \@hosts_ex);
+		}
+		shift;
+	} elsif ( $ARGV[0] eq "-e") {
+		shift;
+		my @arg_hosts = split(/,/,$ARGV[0]);
+		foreach (@arg_hosts){
+			push(@hosts_ex, &expand($_));
+		}
+		shift;
+	} elsif ( $ARGV[0] eq "-A") {
+		shift;
+		my ($suuser,$supasswd) = split(/:/, $ARGV[0]);
+		shift;
+		$thiscmd = &genssh($suuser, $supasswd);
+		$thiscmdunlink = 1;
+		# How to remove this history item?? Impossible?
+		#$rc = system("IDX=\`history |tail -n 1 |cut -d\"\ \" -f2\`;echo \"IDX{\$IDX}\";history -d \$IDX");
+	} elsif ($ARGV[0] eq "-b") {
+		shift;
+		if (-e "$ARGV[0]" ){
+			open(BATCH_FILE, "<$ARGV[0]");
+			@batch_commands = <BATCH_FILE>;
+			close(BATCH_FILE);
+		    $batch_mode = 1;
+		    shift;
+		} else {
+			print "ERROR:\n    Batch_file:\"$ARGV[0]\" open failed.\n";
+			exit 1;
+		}
+	} elsif ($ARGV[0] eq "--install") {
+		shift;
+		&install();
+		exit 0;
+	} else {
+		last;
+	}
+}
+
+if ($#hosts == $[-1) {
+	if ($nprsh_htable ne "") {
+		&table_read_host($nprsh_htable, \@hosts);
+	} elsif ( -e "$nprsh_nodes" ) {
+		open(HOSTFILE, "<$nprsh_nodes");
+			while(<HOSTFILE>) {
+				if (!/^#/ && !/^@/) {
+					#s/\s*#.*//;
+					s/#.*//;
+					s/\s//g;
+					chomp;
+					push(@hosts, &expand($_));
+				}
+			}
+		close(HOSTFILE);
+	}
+}
+
+# .nprsh_badnodes should be compulsory!
+# You can not specify one node using "-e", and,
+# AT the SAME time, let in all nodes in .nprsh_badnodes!
+#if ($#hosts_ex == $[-1) {
+	if ( -e "$nprsh_badnodes" && $ignore_badlist == 0) {
+		open(HOSTFILE, "<$nprsh_badnodes");
+			while(<HOSTFILE>) {
+				if (!/^#/) {
+					#s/\s*#.*//g;  BAD!
+					s/#.*//;
+					s/\s//g;
+					chomp;
+					push(@hosts_ex, &expand($_));
+				}
+			}
+		close(HOSTFILE);
+	}
+#}
+
+# Remove all duplicated nodes.
+#if ($ARGV[0] eq "-up") {
+#	$uniq = 0;
+#}
+
+if ($#hosts >= 0 && $uniq == 1) {
+	my @hltemp = ();
+	my $last = "";
+
+	@hltemp = sort @hosts;
+	@hosts = ();
+	foreach (@hltemp) {
+		if ($_ ne $last) {
+			push @hosts,$_;
+			$last = $_;
+		}
+	}
+}
+
+if ($#hosts_ex >= 0 && $uniq == 1) {
+	my @hltemp = ();
+	my $last = "";
+
+	@hltemp = sort @hosts_ex;
+	@hosts_ex = ();
+	foreach (@hltemp) {
+		if ($_ ne $last) {
+			push @hosts_ex,$_;
+			$last = $_;
+		}
+	}
+}
+
+# "$#hosts_ex" is the index of the last item.
+if ($#hosts >= 0 && $#hosts_ex >= 0 && $uniq == 1) {
+	my $i = 0;
+	my $j = 0;
+
+	while ($i <= $#hosts && $j <= $#hosts_ex) {
+		if ($hosts[$i] lt $hosts_ex[$j]) {
+			$i++;
+		} elsif ($hosts[$i] gt $hosts_ex[$j]) {
+			$j++;
+		} else {
+			$hosts[$i] = "";
+			$i++;
+			$j++;
+		}
+		#print "$i $j\n";
+		#$input = <STDIN>;
+	}
+	# No order, so slow.
+}
+
+if ($#hosts == $[-1) {
+	print "Usage Hint:\n";
+	print "  If you don't specfiy the target-nodes explicitly,\n";
+	print "please create a default target-node file, ~/.nprsh_nodes,\n";
+	print "which is just a newline-separated list of hostnames.\n";
+	exit 0;
+}
+
+if ($gpattern ne "") {
+	my @hltemp = ();
+	foreach (@hosts){
+		if (/^$gpattern/) {
+			push @hltemp,$_;
+		}
+	}
+	@hosts = @hltemp;
+}
+
+if ($prefix ne "") {
+	my @hltemp = ();
+	foreach (@hosts){
+		if ($_ ne "") {
+			push @hltemp,"$prefix$_";
+		}
+	}
+	@hosts = @hltemp;
+}
+
+if ($dryrun == 1) {
+	print "Print all the destination hostname, and then exit.\n" if $verbose;
+	foreach (@hosts){
+		if ($_ ne "") {
+			print "$_\n";
+		}
+	}
+	exit;
+}
+
+# In 2.1.45, for -A mode, I removed the "".
+# The consequence is not clear as of this writing.
+#$command_string = "\"$env_path @ARGV[0..@ARGV-1]\"";
+if ($thiscmd =~ /ssh/) {
+	$thiscmd .= $sshoptions;
+	if ($quiet == 1) {
+		$thiscmd .= " -q";
+	}
+}
+
+$env_path="STARTCOL=$startcol $env_path";
+if ($ARGV[0] =~ /nprsh$|nprsh.pl$/ && $ARGV[@ARGV-1] =~ /;/) {
+    $command_string = "$env_path \"@ARGV[0..@ARGV-2] '@ARGV[@ARGV-1]'\"";
+} else {
+    $command_string = "$env_path \"@ARGV[0..@ARGV-1]\"";
+}
+
+if (! defined $ARGV[0]) {
+	if ($batch_mode == 0) {
+		&nperror("No action to take.", 10);
+		exit -1;
+	}else{
+		print @batch_commands if $verbose;
+		goto CNT2Run;
+	}
+}
+
+if ($ARGV[0] eq "-load") {
+	$command_string = "\"$env_path pidstat 1 1 |grep -v 'Average\\|PID\\|Linux\\|^\$\\|pidstat'\"; echo -n";
+} elsif ($ARGV[0] eq "-push" || $ARGV[0] eq "-bpush") {
+	my $push_string;
+	my $push_command;
+	my $push_binary = 0;
+	my $push_args = "";
+	my $push_file="/tmp/nprsh.bp".rand(1)."%DD";
+
+	if (! defined $ARGV[1]) {
+		&nperror("Push command not provided!", 8);
+	}
+	$push_command = join(" ", @ARGV[1..@ARGV-1]);
+	if ($push_command =~ /\ /) {
+		($push_command, $push_args) = split("\ ", $push_command, 2);
+	}
+	if ($ARGV[0] eq "-bpush" ) {
+		$push_binary = 1;
+	} else {
+		`file $push_command |grep "ELF\ ..-bit" >/dev/null`;
+		if ($? == 0) {
+			$push_binary = 1;
+		}
+	}
+	if ($push_binary == 0) {
+		$push_string = `cat $push_command | gzip -f | base64 -w 0`;
+		$command_string = "\"$env_path echo '$push_string' |base64 -di |zcat |sh -s - $push_args\"";
+	} else {
+		$push_string = `cat $push_command | gzip -f | base64 -w 0`;
+		$command_string = "\"$env_path echo '$push_string' |base64 -di |zcat >$push_file && chmod +x $push_file && $push_file $push_args\"";
+	}
+} elsif ($ARGV[0] eq "-mpiv") {
+	$command_string = "\"$env_path echo 'TVBJTEE9YHBzIGggLUMgb3J0ZWRgIHx8IGV4aXQgMTsgZWNobyAkTVBJTEEgfCBncmVwIHRjcCA+L2Rldi9udWxsIHx8IGV4aXQgMjsgUk9PVElQPWBlY2hvICRNUElMQSB8IHNlZCAicy8uKnRjcDpcL1wvXChbMC05XVwrXC5bMC05XVwrXC5bMC05XVwrXC5bMC05XVwrXCkuKi9cMS8iIGA7IFJPT1Q9YGdyZXAgJFJPT1RJUCAvZXRjL2hvc3RzIHxzZWQgInMvLipcc1woLipcKS9cMS8iYDsgTj1gZWNobyAkTVBJTEEgfCBzZWQgInMvLipvcnRlX2Vzc19udW1fcHJvY3MgXChbMC05XVwrXCkuKi9cMS8iYDsgUkFOSz1gZWNobyAkTVBJTEEgfCBzZWQgInMvLipvcnRlX2Vzc192cGlkIFwoWzAtOV1cK1wpLiovXDEvImA7IHByaW50ZiAiUmFuayAlNGQgb2YgJTRkIGZyb20gJFJPT1RcbiIgJFJBTksgJE4K' |base64 -di |sh - \"";
+
+
+} elsif ($ARGV[0] eq "--dbinit") {
+	# Create the database, the user table.
+	$dbh = DBI->connect("DBI:mysql;host=$dbhost","$dbuser","$dbpass", {'PrintError'=>0, 'RaiseError'=>0, AutoCommit=>0}) || &npdie($DBI::errstr);
+	$dbh->do("CREATE DATABASE $dbname;");
+
+#	&dbinit();
+#	$stmt = "create TABLE nodes (hostname char(8) primary key, version int(8) UNSIGNED, state char(8), ip char(16), ipdev char(8), mac char(18), os char(16), kernel char(64), owner char(16), group1 char(8), group2 char(8), ip2 char(16), ip2dev char(8), mac2 char(18), vbios char(16), position char(8))";
+#	$stmt = "create TABLE repairs (hostname char(8), version int(8) UNSIGNED, reasoncode char(8), state char(8), position char(8), description nvarchar(1024))";
+#	$stmt = "create TABLE hosttables (datetime char(16) key, owner char(8), talias char (16), department char(8), comments nvarchar(1024))";
+#	$stmt = "create TABLE admins (name char(8) primary key, department char(8), privilege char(8))";
+#	$stmt = "load data infile '/tmp/nodes' into table nodes (hostname,ip,version,state,os,kernel,ipdev,vbios)";
+
+#	&dbexit();
+	exit;
+} elsif ($ARGV[0] eq "-import") {
+    # TODO A table is a snapshot. You can't delete it or change it.
+    # At the time, a table is updated. You get another table, actually.
+    # Using alias, I can make the changes of table name transparent to users.
+    my $tablename;
+    my $owner = $ARGV[1];
+    my $talias = $ARGV[2];
+    my $comments = "@ARGV[3..@ARGV-1]";
+	my $timestamp;
+	my $stmt;
+	my $hversion;
+	my $hstate;
+	my @import_list;
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst);
+
+	if (! defined $owner || $owner eq "") {
+		&nperror("Please tell me who you are!", 4);
+		exit;
+	}
+
+	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	$timestamp = sprintf("%4d%02d%02d_%02d%02d%02d", $year+1900,$mon+1,$mday,$hour,$min,$sec);
+	$tablename = $timestamp."_".$owner;
+
+	&dbinit();
+
+	my $sth = $dbh->prepare("SELECT name FROM $dbname_users WHERE name = \"$owner\"");
+	$sth->execute() or die $DBI::errstr;
+	my $results = $sth->fetchrow_array();
+	if (defined $results && $results eq $owner) {
+		print "Create host table \"$tablename\" for $owner with comments: \"$comments\"\n";
+	} else {
+		print ("\033\[31;1mError:\033\[0m $owner is NOT an authorized sysadmin!\n");
+		exit (2);
+	}
+
+	if (! defined $talias) {
+		$talias = "";
+	}
+	$stmt = "INSERT INTO $dbname_htables (datetime,owner,talias,comments) VALUES ('$timestamp','$owner','$talias','$comments')";
+	$sth = $dbh->prepare($stmt) || die "prepare: $$stmt: $DBI::errstr";
+	$sth->execute ();
+	$sth->finish ();
+
+	#$dbh->do("DROP TABLE IF EXISTS '$tablename'");
+
+	$stmt = "CREATE TABLE $tablename (hostname char(8),version int(8) UNSIGNED)";
+	$sth = $dbh->prepare($stmt) || die "prepare: $$stmt: $DBI::errstr";
+	$sth->execute ();
+	$sth->finish ();
+
+	# Retrive the version, state of a node.
+	$stmt = "SELECT version,state FROM $dbname_nodes WHERE hostname = ?";
+	$sth = $dbh->prepare($stmt) || die "prepare: $$stmt: $DBI::errstr";
+	foreach (@hosts){
+		if ($_ ne "") {
+			print "\tRetrive $_\n" if $verbose;
+			$sth->execute($_) || die "Execute: $$stmt: $DBI::errstr";
+			($hversion, $hstate) = $sth->fetchrow_array();
+			# TODO Check the validity of this node.
+			push (@import_list, [$_, $hversion, $hstate]);
+		}
+	}
+	$sth->finish();
+
+	$stmt = "INSERT INTO $tablename (hostname, version) VALUES (?,?)";
+	$sth = $dbh->prepare($stmt) || die "prepare: $$stmt: $DBI::errstr";
+
+	# trap errors using eval{}
+	eval {
+		print "Import nodes:\n";
+		foreach (@import_list){
+			print "\t$_->[0] (vesion: $_->[1])\n";
+			$sth->execute($_->[0], $_->[1]) || die "Execute: $$stmt: $DBI::errstr";
+		}
+		$sth->finish();
+
+		# commit changes
+		$dbh->commit() or die $DBI::errstr;
+	};
+
+	# In case any error occurs, rollback
+	if ($@) {
+		print "Transaction aborted: $@";
+		$dbh->rollback();
+	}
+
+	if ($comments eq "") {
+		print "One more chance to leave a comment about this new table.\n";
+		$comments = &PromptUser("Enter","");
+		if ($comments ne "") {
+			printf "Add comments to ${timestamp}_$owner\n" if $verbose;
+			$stmt = "UPDATE $dbname_htables SET comments=? WHERE datetime='$timestamp' AND owner='$owner'";
+			$sth = $dbh->prepare($stmt);
+			$sth->execute("$comments") || die "Execute: $$stmt: $DBI::errstr";
+			$sth->finish ();
+		}
+	}
+	&dbexit();
+	exit;
+} elsif ($ARGV[0] eq "-checkf" || $ARGV[0] eq "-checkt") {
+	my $stmt;
+	my @diff_array = ();
+	my $hostname;
+	my $version;
+	my $state;
+	my $description;
+	my $comments;
+	my $owner;
+
+	&dbinit();
+
+	my $sth = $dbh->prepare("SELECT version,state FROM $dbname_nodes WHERE hostname = ?");
+	my $results;
+	foreach (@hosts){
+		if ($_ ne "") {
+			$sth->execute($_) || die "Execute: $$stmt: $DBI::errstr";
+			($version, $state) = $sth->fetchrow_array();
+			# if not the lasted version, put in an array.
+			if (defined $version && $version%2 == 1) {
+                print "\tCheck $_ -  $version - $state\n" if $verbose;
+                push (@diff_array, [$_, $version]);
+			}
+		}
+	}
+	$sth->finish ();
+
+    # TODO The repairs table should have a OWNER field!!
+    #      Who reported? Who confirmed? Who repairs?
+	# Retrieve the reason code and description from repairs.
+	if (@diff_array > 0) {
+        $sth = $dbh->prepare("SELECT state,description FROM $dbname_repair WHERE hostname=? AND version=?");
+        print ("\033\[31;1mHost\tVer.\tState\tDescription\033\[0m\n");
+		foreach (@diff_array) {
+			$sth->execute($_->[0], $_->[1]) || die "Execute: $$stmt: $DBI::errstr";
+			($state, $description) = $sth->fetchrow_array();
+            if (!defined $description) {
+                $description = "-";
+            }
+            print "$_->[0]\t$_->[1]\t$state\t$description\n";
+		}
+        $sth->finish ();
+	}
+
+	&dbexit();
+	exit;
+} elsif ($ARGV[0] eq "-update") {
+	my $stmt;
+	my $sth;
+	my @update_array = ();
+	my @diff_array = ();
+	my $hostname;
+	my $version;
+	my $state;
+	my $newversion;
+	my $comments;
+	my $choice = "";
+
+	&dbinit();
+
+    if (! defined $nprsh_htable || $nprsh_htable eq "" || $nprsh_htable eq $dbname_nodes) {
+        &nperror("Please specify the target table!", 8);
+        exit 3;
+    }
+
+    $sth = $dbh->prepare("SELECT version FROM $nprsh_htable WHERE hostname = ?");
+	foreach (@hosts){
+		if ($_ ne "") {
+			$sth->execute($_) || die "Execute: $$stmt: $DBI::errstr";
+			$version = $sth->fetchrow_array();
+            push (@update_array, [$_, $version]);
+        }
+    }
+	$sth->finish ();
+
+	$sth = $dbh->prepare("SELECT version,state FROM $dbname_nodes WHERE hostname = ?");
+    print ("\033\[32;1mHost\tOldVer\tNewVer\tUpdate?\033\[0m ['n': Remove this node]\n");
+	foreach (@hosts){
+		if ($_ ne "") {
+			$sth->execute($_) || die "Execute: $$stmt: $DBI::errstr";
+			($version, $state) = $sth->fetchrow_array();
+			# if not the lasted version, prompt the user.
+            # "y", update this node; "Y", update all following nodes.
+            # Remember all the choices in @diff_array, change the table later.
+            # TODO How to locate the $_ in the @update_array?
+			if (defined $version && $version%2 == 0) {
+                print "$_\t$version\t$version\t[Y/y/n]? ";
+                if ($choice ne "Y") {
+                    $choice = &PromptUser("","");
+                } else {
+                    print "Y\n";
+                }
+                if ($choice eq "Y") {
+                }
+			}
+            push (@diff_array, [$_, $version]);
+		}
+	}
+	$sth->finish ();
+
+	# Clone the $nprsh_htable, using the diff info in @diff_array.
+	if (@diff_array > 0) {
+		foreach (@diff_array) {
+		}
+	}
+
+	&dbexit();
+	exit;
+} elsif ($ARGV[0] eq "-kick") {
+	# Kick nodes into the $dbname_repair table, which is in the form of:
+	# hostname, version, reason code, desc
+	my $stmt;
+	my $sth;
+	my $reasoncode = $ARGV[1];
+    my $badnodes;
+	my $hstate;
+	my $hversion;
+	my $hposition;
+	my @kick_list;
+	my $results;
+
+	&dbinit();
+
+	$stmt = "SELECT version,state,position FROM $dbname_nodes WHERE hostname = ?";
+	$sth = $dbh->prepare($stmt) || die "prepare: $$stmt: $DBI::errstr";
+	foreach (@hosts){
+		if ($_ ne "") {
+			print "\tRetriveNode $_\n" if $verbose;
+			$sth->execute($_) || die "Execute: $$stmt: $DBI::errstr";
+			($hversion, $hstate, $hposition) = $sth->fetchrow_array();
+			# TODO Check the validity of this node.
+			push (@kick_list, [$_, $hversion, $hstate, $hposition]);
+		}
+	}
+	$sth->finish();
+
+	# NOACK    修理人员还不知道（kick的默认结果）
+	# TOFETCH  修理人员知道了，但还没处理（没取走）
+	# INSHOP   在修理处，（应更新position）
+	# CONFIRM  故障现象得到确认
+	# FIXING   在修理
+	# READY    得到了修理，待送还或者领取（通过pull来取出）
+	if ($reasoncode eq "") {
+		$reasoncode = "UNKNOWN";
+	}
+	$stmt = "INSERT INTO $dbname_repair (hostname,version,reasoncode,state,position) VALUES (?,?,?,?,?)";
+	$sth = $dbh->prepare($stmt);
+	foreach (@kick_list){
+		print "\tKick $_->[0] @ $_->[4] for $reasoncode reason\n";
+		$sth->execute($_->[0],$_->[1]+1,$reasoncode,"NOACK", $_->[4]) || die "Execute: $$stmt: $DBI::errstr";
+	}
+	$sth->finish ();
+
+	# Update the $dbname_nodes table
+	# TODO The most important problem is how to avoid race conditions!!!
+	#      How to be more atomic?
+	$stmt = "UPDATE $dbname_nodes SET version=?,state=? WHERE hostname=?";
+	$sth = $dbh->prepare($stmt);
+	foreach (@kick_list){
+		print "\tUpdate version of $_->[0]\n";
+		$sth->execute($_->[1]+1, "NOACK", $_->[0]) || die "Execute: $$stmt: $DBI::errstr";
+	}
+	$sth->finish ();
+
+	&dbexit();
+	exit;
+} elsif ($ARGV[0] eq "-pull") {
+	my $hversion;
+	my $hstate;
+	my $hposition;
+	my $stmt;
+	my $sth;
+	my @pull_list;
+	&dbinit();
+
+	# Check if the hosts in the specified hostfile are all useable;
+	# Retrive the version, state of a node.
+	$stmt = "SELECT version,state,position FROM $dbname_nodes WHERE hostname = ?";
+	$sth = $dbh->prepare($stmt) || die "prepare: $$stmt: $DBI::errstr";
+	foreach (@hosts){
+		if ($_ ne "") {
+			print "\tRetriveNode $_\n" if $verbose;
+			$sth->execute($_) || die "Execute: $$stmt: $DBI::errstr";
+			($hversion, $hstate, $hposition) = $sth->fetchrow_array();
+			# TODO Check the validity of this node.
+			push (@pull_list, [$_, $hversion, $hstate, $hposition]);
+		}
+	}
+	$sth->finish();
+
+	$stmt = "SELECT version,state,position FROM $dbname_repair WHERE hostname = ? AND version = ?";
+	$sth = $dbh->prepare($stmt) || die "prepare: $$stmt: $DBI::errstr";
+	foreach (@pull_list){
+			print "\tCheck state of $_->[0]\n";
+			$sth->execute($_->[0],$_->[1]) || die "Execute: $$stmt: $DBI::errstr";
+			($hversion, $hstate, $hposition) = $sth->fetchrow_array();
+			# TODO What if no results?
+			# TODO Check the validity of this node.
+			if ($hstate ne "READY") {
+				print "Error: $_->[0] not ready to pull\n";
+				$_->[1] = 0;
+			} else {
+				print "$_->[0] is ready\n";
+			}
+	}
+	$sth->finish();
+
+	$stmt = "UPDATE $dbname_nodes SET version=? WHERE hostname=? AND version=?";
+	$sth = $dbh->prepare($stmt);
+	foreach (@pull_list){
+		if ($_->[1] != 0) {
+			print "\tUpdate version of $_->[0]\n";
+			$sth->execute($_->[1]+1, $_->[0], $_->[1]) || die "Execute: $$stmt: $DBI::errstr";
+		} else {
+			print "\t$_->[0] Ignored\n";
+		}
+	}
+	$sth->finish ();
+
+	&dbexit();
+	exit;
+} elsif ($ARGV[0] eq "-set") {
+	# A simple nprsh wrapper of mysql statements, but it is so danger!
+	my $field = $ARGV[1];
+	my $value = $ARGV[2];
+	my $stmt;
+	my $sth;
+
+	&dbinit();
+
+	$stmt = "UPDATE $dbname_nodes SET $field=? WHERE hostname=?";
+	$sth = $dbh->prepare($stmt);
+	foreach (@hosts){
+		if ($_ ne "") {
+			print "\tUpdate $_: $field = $value\n";
+			$sth->execute($value, $_) || die "Execute: $$stmt: $DBI::errstr";
+		}
+	}
+	$sth->finish ();
+
+	&dbexit();
+	exit;
+} elsif ($ARGV[0] eq "-listt" || $ARGV[0] eq "-listtable") {
+	# A simple nprsh wrapper of mysql statements, but it is so danger!
+	my $owner = $ARGV[1];
+	my $datetostart = $ARGV[2];
+	my $datetostop = $ARGV[3];
+	my $stmt;
+	my $sth;
+	my $datetime;
+	my $talias;
+	my $comments;
+	my $timestring = "";
+	my @listt_list;
+	my @tmp_list;
+
+	&dbinit();
+
+	while (!defined $owner || $owner eq "") {
+		print "Please specify the Table Owner.\n";
+		$owner = &PromptUser("Enter","");
+	}
+	if (&checkadmin($owner, "CC")) {
+		exit;
+	}
+	if (defined $datetostart && $datetostart ne "") {
+		$timestring = " AND datetime>=\"$datetostart\"";
+		if (defined $datetostop && $datetostop ne "") {
+			$timestring .= " AND datetime<=\"$datetostop\"";
+		}
+	}
+	$stmt = "SELECT datetime,talias,comments FROM $dbname_htables WHERE owner = \"$owner\"".$timestring." ORDER BY datetime";
+	$sth = $dbh->prepare($stmt);
+	$sth->execute() || die "Execute: $$stmt: $DBI::errstr";
+	print ("\033\[32;1m \tTable\t\t\tAlias\tComments\033\[0m\n");
+	while(($datetime, $talias, $comments) = $sth->fetchrow_array()) {
+		print "\t${datetime}_$owner\t$talias\t$comments\n";
+	}
+	$sth->finish ();
+
+	&dbexit();
+	exit;
+} elsif ($ARGV[0] eq "-setdefault") {
+	# set the default
+	# A good habit is to specify who you are talking to explicitly.
+	# So, I will not implement this funtion.
+	my $htable = $ARGV[1];
+
+	exit;
+	# Make everyone in the game.
+} elsif ($ARGV[0] eq "-net") {
+	my @hltemp = ();
+	my $i;
+	my $j;
+	my $testcmd = "@ARGV[1..@ARGV-1]";
+
+	foreach (@hosts){
+		if ($_ ne "") {
+			push @hltemp,$_;
+		}
+	}
+	if ($pair == 0) {
+		$pair = int(($#hltemp+1)/2);
+	}
+	for ($i=0;$i <= ($#hltemp+1-$pair*2);$i+=$pair*2) {
+		for($j=0;$j<$pair;$j++) {
+			&pairtest($hltemp[$i+$j], $hltemp[$i+$j+$pair], $testcmd);
+			#print "$hltemp[$i+$j] --- $hltemp[$i+$j+$pair]\n";
+		}
+	}
+	&blindwait();
+	exit;
+
+} elsif ($ARGV[0] eq "-U") {
+    my $newuser = $ARGV[1];
+    my $group = $ARGV[2];
+    my $passwd = $ARGV[3];
+	my $tool;
+	my $rc;
+
+	$tool = &genscript();
+	print "Create user $newuser:\n";
+	foreach (@hosts) {
+		if ( $_ eq "" ) {
+			next;
+		}
+		print "    at $_ ";
+		$rc = system("$tool $_ $newuser $group $passwd 2>/dev/null");
+		if ($rc) {
+			print "\033\[31;1mfailed.\033\[0m\n";
+		} else {
+			print "\033\[32;1msuccess.\033\[0m\n";
+		}
+	}
+	unlink $tool;
+
+	exit 0;
+
+} elsif ($ARGV[0] eq "-P") {
+    my $user = $ARGV[1];
+    my $group = $ARGV[2];
+	my $key = "";
+	my $rc;
+
+	if (! -e "/home/$user/.ssh") {
+		$rc = system("mkdir /home/$user/.ssh");
+		if ($rc) {
+			die "Where is the home of $user?";
+		}
+	}
+
+	if (! -e "/home/$user/.ssh/id_rsa"
+	    || ! -e "/home/$user/.ssh/id_rsa.pub" ) {
+	    $rc += system("ssh-keygen -t rsa -N \"\" -C \"User: $user; Group: $group; HomeH: $ENV{'HOSTNAME'}\" -f id_rsa.$user");
+		$rc += system("cp id_rsa.$user /home/$user/.ssh/id_rsa");
+		$rc += system("cp id_rsa.$user.pub /home/$user/.ssh/id_rsa.pub");
+	}
+
+	if (! -e "/home/$user/.ssh/authorized_keys" ) {
+		$rc += system("cp /home/$user/.ssh/id_rsa.pub /home/$user/.ssh/authorized_keys");
+	}
+
+	open(SSH_CONFIG, ">>/home/$user/.ssh/config");
+	print SSH_CONFIG "Host *\n";
+	print SSH_CONFIG "    ForwardX11 no\n";
+	print SSH_CONFIG "    StrictHostKeyChecking no\n";
+	print SSH_CONFIG "    VerifyHostKeyDNS no\n";
+	print SSH_CONFIG "    IdentityFile ~/.ssh/id_rsa\n";
+	print SSH_CONFIG "    Protocol 2\n";
+	print SSH_CONFIG "    CheckHostIP no\n";
+	print SSH_CONFIG "    Compression no\n";
+	print SSH_CONFIG "#   LogLevel QUIET\n";
+	print SSH_CONFIG "    PreferredAuthentications publickey,password\n";
+	print SSH_CONFIG "    TCPKeepAlive yes\n";
+	print SSH_CONFIG "    HashKnownHosts no\n";
+	print SSH_CONFIG "    BatchMode no\n";
+	close(SSH_CONFIG);
+
+	$rc += system("chown -R $user:$group /home/$user/.ssh");
+	$rc += system("chmod -R 600 /home/$user/.ssh");
+	$rc += system("chmod 700 /home/$user/.ssh");
+
+	print "Sync to:\n";
+	foreach (@hosts) {
+		if ( $_ eq "" ) {
+			next;
+		}
+		print "    [$_] ";
+		$rc += system("rsync -rogle ssh /home/$user/.ssh $_:/home/$user/ 2>/dev/null");
+		if ($rc) {
+			print "\033\[31;1mfailed ($rc).\033\[0m\n";
+		} else {
+			print "\033\[32;1msuccess.\033\[0m\n";
+		}
+	}
+
+	exit 0;
+
+} elsif ($ARGV[0] eq "-up") {
+    my $i = 0;
+	my %whosup = ();
+	my @badlist = ();
+    my $ng = 0;
+    my $nd = 0;
+    my $nb = 0;
+
+	print "Host Up/Down State:\n";
+	open(HOSTFILE, ">$nmap_hlst_file");
+	foreach (@hosts) {
+		print HOSTFILE "$_\n";
+    }
+	close(HOSTFILE);
+	# In CentOS, the --system-dns is not necessary.
+	system "nmap --system-dns -sP -iL $nmap_hlst_file >$nmap_out_file 2>/dev/null";
+
+	open(HOSTFILE, "<$nmap_out_file");
+	while(<HOSTFILE>) {
+		if ((/^Host\ (.*?)\ .*be\ up\./) 
+                   || (/^Nmap scan report for\ (.*?)\ (.*)$/)) {
+                   #|| (/^Nmap scan report for\ (.*?)\ .*$\\rHost is up/)) {
+			$whosup{$1} = 1;
+		}
+	}
+
+	foreach (@hosts){
+	    if (defined $whosup{$_} && $whosup{$_} == 1) {
+			print " $_\t";
+			$ng++;
+		} else {
+			if ($_ eq "") {
+				print "  \033\[31;1m--\033\[0m\t";
+				$nb++;
+			} else {
+				print "\033\[31;1m[$_]\033\[0m\t";
+				push @badlist,$_;
+				$nd++;
+			}
+		}
+
+		$i++;
+		if (($i % 10) == 0) {
+			print "\n";
+	    }
+	}
+	if (($i % 10) != 0) {
+		print "\n";
+	}
+	close(HOSTFILE);
+
+	if ($donotoverwrite == 0) {
+		open(HOSTFILE,">$downnodelist") || print "Can’t open $downnodelist for write.";
+		print HOSTFILE "\#Down Nodes:\n";
+		foreach (@badlist) {
+			print HOSTFILE "$_\n";
+		}
+		close(HOSTFILE);
+	}
+
+ 	print "Summary:\n";
+ 	printf " Good nodes: %4d\n", $ng;
+ 	printf " Down nodes: \033\[31;1m%4d\033\[0m\n", $nd;
+ 	printf " Huai nodes: %4d\n", $nb;
+	exit 0;
+} elsif ($ARGV[0] eq "-rst" || $ARGV[0] eq "-kai" || $ARGV[0] eq "-guan") {
+	my $bip;
+	my $bip2;
+	my $bid;
+	my $tool;
+	my $input;
+	my $action;
+	my $action_str;
+	my $rc;
+
+	if ($ARGV[0] eq "-rst") {
+		$action = 2;
+		$action_str = "Reset";
+	} elsif ($ARGV[0] eq "-kai") {
+		$action = 1;
+		$action_str = "Power on";
+	} elsif ($ARGV[0] eq "-guan") {
+		$action = 12;
+		$action_str = "Power off";
+	}
+
+	if ($#hosts >= 4) {
+		print "Are you SURE you want to play with SO MANY nodes? (yes/NO)";
+		$input = <STDIN>;
+		chomp $input;
+
+		if ($input ne "yes") {
+			print "Canceled!\n";
+			exit 0;
+		}
+	}
+
+	$tool = &genrenew();
+	foreach (@hosts) {
+		if ($_ ne "") {
+			($bip,$bip2,$bid) = &trname($_);
+			print "$action_str $_ ";
+			$rc = system("$tool $bip $bid $action $blduser $bldpass 2>/dev/null");
+			if ($rc && $twotry) {
+				$rc = system("$tool $bip2 $bid $action $blduser $bldpass 2>/dev/null");
+				#print "$tool $bip $bid $blduser $bldpass\n";
+			}
+			if ($rc) {
+				#print "failed.\n";
+				print "\033\[31;1mfailed.\033\[0m\n";
+			} else {
+				print "\033\[32;1msuccess.\033\[0m\n";
+			}
+		}
+	}
+	unlink $tool;
+
+	exit 0;
+}
+
+CNT2Run:
+# Register the sig handler!
+$SIG{TERM} = \&catch_kill;
+$SIG{KILL} = \&catch_kill;
+$SIG{INT} = \&catch_kill;
+
+#&checkver();
+
+if ($mp > 0) {
+	my $ncores = ($#hosts + 1)*$smp/$mt;
+	my $hlist = "";
+	my $rootnode = "";
+	my $cs = 0;
+	my $tid = 0;
+	my $i = 0;
+	my $next_pid = 0;
+	my $command = join(" ",@ARGV[0..@ARGV-1]);
+	my $mpcmd_string = "";
+	my $xhplcmd = @ARGV[@ARGV-1];
+	my $xhplconf = "HPL.dat";
+	my $template_idx = 1;
+	my $returned_no;
+	my $pid_rexec;
+
+	if ($mp > $ncores) {
+		print "Usage Hint:\n";
+		print "\tAvailable CPU/Cores are far from enough ($mp vs $ncores).\n";
+		exit -1;
+	}
+
+	if ($template == 1) {
+		open(XHPLCONFS, "<$templatedir/$templateconf") || die "Can't open $templatedir/$templateconf: $!";
+			while(<XHPLCONFS>) {
+				if (!/^#/) {
+					chomp;
+					if (/^$mp/) {
+						print "$_\n" if $debug;
+						&genconf($_, $template);
+						$template++;
+					}
+				}
+			}
+		close(XHPLCONFS);
+
+		if ($template == 1) {
+			die "Can't find one conf line in $templatedir/$templateconf.";
+		}
+	}
+
+	foreach (@hosts) {
+		chomp;
+		if ($_ ne "") {
+			if ($cs ==0) {
+				$rootnode = $_;
+			}
+			for ($i=0;$i < $smp/$mt;$i++) {
+				$hlist .= "$_ ";
+				$cs++;
+			}
+		}
+		if ($cs >= $mp) {
+			$mpcmd_string = "$thiscmd $rootnode $mpicmd -np $mp ".$hlist.$command;
+
+			# Copy HPL.dat to the rootnode.
+			if ($template == 0) {
+				$xhplconf = "HPL.dat_$mp";
+			} else {
+				$xhplconf = "$templatedir/HPL.dat_$mp.$template_idx";
+				$template_idx++;
+				if ($template_idx >= $template) {
+					$template_idx = 1;
+				}
+			}
+			if ( $ENV{'HOSTNAME'} ne $rootnode || $ENV{'PWD'} ne $ENV{'HOME'} ) {
+				if ( -e "$xhplconf" ) {
+					system("$thiscmd $rootnode \"test -e ~/HPL.dat \&\& mv ~/HPL.dat\{,.last\}\"");
+					system("scp $xhplconf $rootnode:~/HPL.dat");
+				}else{
+					print "nprsh ERROR: NO xhpl conf available!\n";
+					exit -1;
+				}
+
+				# Copy xhpl to the rootnode ONLY. Using nfs or some other techniques, up to you.
+				if ( -e "$xhplcmd" ) {
+					system("$thiscmd $rootnode \"test -e ~/$xhplcmd \&\& mv ~/$xhplcmd\{,.last\}\"");
+					system("scp $xhplcmd $rootnode:~/");
+				}else{
+					print "nprsh ERROR: Bad MPIAPP [$xhplcmd]!\n";
+					exit -1;
+				}
+			}
+
+			$pid_rexec = fork;
+			if ($pid_rexec == 0) {
+				print "Run \"" . $mpcmd_string . "\"" . "......\n";
+				open(STDOUT, ">$rootnode.out") || print "Cannot redirect stdout to $rootnode.out";
+				open(STDERR, ">$rootnode.err") || print "Cannot redirect stderr to $rootnode.err";
+				$mpcmd_string = "$thiscmd $rootnode sleep 20" if $debug;
+				exec($mpcmd_string);
+			}else{
+				open(TASK_INFO, ">$rootnode.info");
+				print TASK_INFO "ROOT: $rootnode\n";
+				print TASK_INFO "MPIRUN: $mpicmd\n";
+				print TASK_INFO "NP: $mp\n";
+				print TASK_INFO "HL: $hlist\n";
+				print TASK_INFO "CMD: $command\n";
+				close(TASK_INFO);
+
+				$pids[$tid] = $pid_rexec;
+				$pid_host[$tid] = $rootnode;
+				$tid += 1;
+			}
+
+			$cs = 0;
+			$hlist = "";
+		}
+	}
+
+	#goto label is lost after perlcc -B?
+	#goto WAIT_CHILD;
+
+	$returned_no = 0;
+	while (1) {
+		$next_pid = wait;
+		if ($next_pid == -1) {
+			print ("All processes have exited.\n");
+			exit 0;
+		}
+
+		$i = 0;
+		while ($pids[$i] > 0){
+			if ($pids[$i] == $next_pid) {
+				print ("Job at $pid_host[$i] have exited.\n");
+				last;
+			}
+			$i++;
+		}
+
+		$pids_returned[$returned_no] = $next_pid;
+		$returned_no += 1;
+		if ($returned_no == $tid) {
+			exit 0;
+		}
+	}
+}
+
+# Only file distribution is supported, NOT file gather!
+# Look at the position of hostname in @ARGV!
+# It is REALLY fast, but I have to check the results.
+if ($distribution == 1 && ($#hosts + 1) > $distribution_degree) {
+	use File::Basename;
+	my $command = "";
+	my $command_str = join(" ",@ARGV[0..@ARGV-1]);
+	my $pid_rexec;
+	my $num;
+	my $NEWcommand = "";
+	my $origin;
+	my $originuser;
+	my $originfile;
+	my $origindir;
+	my $destdir;
+	my $last;
+	my @hltemp;
+	my $subgroupsize;
+	my $goodchild;
+
+	# nprsh [HOSTS] RCP/SCP USER@HOST:SPATH DPATH
+	# nprsh [HOSTS] RSYNC -rle SSH/RSH USER@HOST:SPATH DPATH
+	($origin, $originfile) = split(/:/, @ARGV[@ARGV-2]);
+	if ($origin =~ /@/) {
+		($originuser, $origin) = split(/@/, $origin);
+	}
+
+	print "origin user: $originuser\n" if $verbose;
+	print "origin path: $origin\n" if $verbose;
+	#TODO Remove the $origin from @hosts IF the destdir and the src dir are identical.
+	$origindir = dirname($originfile)."/";
+	# the dest is a Path or a Path&Rename??
+	# Do keep the last "/" in $destdir.
+	$destdir = @ARGV[@ARGV-1];
+	if ($origindir eq $destdir) {
+		@hltemp =@hosts;
+		@hosts = ();
+		foreach (@hltemp) {
+			if ($_ ne $origin && $_ ne "") {
+				push @hosts,$_;
+			}
+		}
+	} else {
+		@hltemp =@hosts;
+		@hosts = ();
+		foreach (@hltemp) {
+			if ($_ ne "") {
+				push @hosts,$_;
+			}
+		}
+	}
+
+	if (($#hosts+1) < $distribution_degree) {
+		$distribution_degree = $#hosts + 1;
+	}
+	for (my $i=0;$i<$distribution_degree;$i++) {
+		chomp $hosts[$i];
+		$subgroupsize = ($#hosts + 1)/$distribution_degree - 1;
+		if ($subgroupsize < 1) {
+			if ($i == 0) {
+				$children = join(",", @hosts[$distribution_degree..$#hosts]);
+			} else {
+				$children = "";
+			}
+		} else {
+			if ($i != ($distribution_degree - 1)) {
+				$last = $subgroupsize*($i+1)+$distribution_degree-1;
+			} else {
+				$last = $#hosts;
+			}
+			$children = join(",", @hosts[($subgroupsize*$i+$distribution_degree)..$last]);
+		}
+
+		$NEWcommand = $command_str;
+		$NEWcommand =~ s/$origin\:$origindir/$hosts[$i]\:$destdir/;
+		if ($children eq "") {
+			$command = "$thiscmd $hosts[$i] \"$command_str\"";
+		} else {
+			if ($i == 0) {
+				$command = "$thiscmd $hosts[$i] \"$command_str && /usr/local/bin/nprsh -on $children -D $distribution_degree -R $rl $NEWcommand\"";
+				if ($rl > 0) {
+					my $i;
+					my $str = "==>";
+					for($i=1;$i<=$rl;$i++) {
+						$str = $str." $i ==>";
+					}
+					print "$str\n";
+				}
+			} else {
+				$command = "$thiscmd $hosts[$i] \"$command_str && /usr/local/bin/nprsh -on $children -D $distribution_degree $NEWcommand\"";
+			}
+		}
+		print "$command\n" if ($verbose);
+
+		$pid_rexec = fork;
+		if ($pid_rexec == 0) {
+			exec($command);
+		}else{
+			$pids[$i] = $pid_rexec;
+			$pid_host[$i] = $hosts[$i];
+		}
+	}
+
+	$num = 0;
+	while ($num < $distribution_degree) {
+		$goodchild = wait();
+		if ($goodchild == -1) {
+			die "waitpid() error: $!";
+		}
+		for (my $i=0;$i<$distribution_degree;$i++) {
+			if ($goodchild == $pids[$i]) {
+				$num++;
+			}
+		}
+	}
+
+	#TODO Check the availability in all dest nodes.
+	exit;
+}
+
+# Run command locally.
+	if ($lexe == 1 ) {
+		my $input = "Y";
+		my $nodes = 0;
+		my @slots = (0);
+		my @slot_dest = ();
+		my $slotnum = ($width - 1);
+		my $slot2wait = 0;
+		my $slot2fill = 0;
+		my $pid_worker = 0;
+		my $goodchild = 0;
+        my $commandline = "";
+		my $pid_rexec;
+
+		if ($para == 0) {
+			foreach (@hosts){
+				chomp;
+				if ($_ ne ""){
+                    $commandline = $command_string;
+					while ($commandline =~ /%DD/) {
+						if ($commandline =~ /%DD\/(\w*)\/(\w*)\//) {
+							my $tmp = $_;
+							my $one = $1;
+							my $two = $2;
+							$tmp =~ s/$one/$two/g;
+							$commandline =~ s/%DD\/$one\/$two\//$tmp/;
+						}else{
+							$commandline =~ s/%DD/$_/;
+						}
+					}
+					$commandline =~ s/"//g;
+					#$command = "$thiscmd $_ $commandline";
+					if ($interactive == 1) {
+						print "Run $commandline? [Y/n]: ";
+						$input = <STDIN>;
+						chomp $input;
+					} else {
+						print "RunT $commandline\n" if $verbose;
+					}
+					if ($input eq "n") {
+						print "Canceled!\n";
+					} else {
+						if ($slotnum == 0) {
+							#print "Wait at slot[$slot2wait]: $slots[$slot2wait]. Slotdest: @slot_dest.\n";
+							$goodchild = waitpid($slots[$slot2wait], 0);
+						if ($goodchild == $slots[$slot2wait]) {
+							$slotnum++;
+						} elsif ($goodchild == -1) {
+							#print "No such a process.\n" if $verbose;
+							$slotnum++;
+						} else {
+							die "waitpid() error: $!";
+						}
+						$slot2wait++;
+						if ($slot2wait >= $width) {
+							$slot2wait = 0;
+						}
+					}
+					if ($color_on == 1) {
+						$out_color++;
+						if ($out_color >= 39 ) {
+							$out_color=32;
+						}
+					}
+					sleep $sinterval;
+					$pid_worker = fork;
+					if ($pid_worker == 0) {
+						if ($color_on == 1) {
+							open STDERR, "| sed -e 's/^/\033\[31;1m[$_]\033\[0m \/g'";
+							open STDOUT, "| sed -e 's/^/[\033\[$out_color;1m$_\033\[0m] \/g'";
+						}else{
+							open STDERR, "| sed -e 's/^/[$_] /g'";
+							open STDOUT, "| sed -e 's/^/[$_] /g'";
+						}
+						exec($commandline);
+					}else{
+						$slots[$slot2fill] = $pid_worker;
+						$slot_dest[$slot2fill] = $_;
+						$slot2fill++;
+						if ($slot2fill >= $width) {
+							$slot2fill = 0;
+						}
+						$slotnum--;
+					}
+			    }
+			}
+		}
+
+		$goodchild = 0;
+		while ($slotnum < ($width - 1) || $goodchild != -1) {
+			$goodchild = wait();
+			if ($goodchild != -1) {
+				$slotnum++;
+			}
+		}
+		exit 0;
+	} else {
+		foreach (@hosts){
+			chomp;
+			$command = join(" ",$thiscmd,$command_string);
+			$command =~ s/%DD/$_/g;
+			$command = $command."; echo \"********$_ Done!\"";
+			$pid_rexec = fork;
+			if ($pid_rexec == 0) {
+				exec($command);
+			}else{
+				$pids[$nodes] = $pid_rexec;
+				$pid_host[$nodes] = $_;
+				$nodes += 1;
+			}
+		}
+
+		$children = $nodes;
+
+		#goto WAIT_CHILD;
+		my $returned_no = 0;
+		my $next_pid;
+		while (1) {
+			$next_pid = wait;
+			if ($next_pid == -1) {
+				print ("All processes have exited.\n");
+				exit 0;
+			}
+			$pids_returned[$returned_no] = $next_pid;
+			print ("processes $next_pid have exited.\n") if $verbose;
+			$returned_no += 1;
+
+			if ($returned_no == $children) {
+				exit 0;
+			}
+		}
+	}
+}
+
+# This mode is identical to the original "prsh" script.
+if ( $para == 0) {
+	my $input = "Y";
+
+	foreach (@hosts){
+		chomp;
+		if ($_ ne ""){
+			if ($batch_mode == 0) {
+				$command = "$thiscmd $_ $command_string";
+				$command =~ s/%DD/$_/g;
+				if ($interactive == 1) {
+					print "Run $thiscmd $_ $command_string? [Y/n]:";
+					$input = <STDIN>;
+					chomp $input;
+				} else {
+					print "Run $thiscmd $_ $command_string with interval of $sinterval seconds\n" if $verbose;
+				    sleep $sinterval;
+				}
+				if ($input eq "n") {
+					print "Canceled\n";
+				} else {
+					system($command);
+			    }
+			} else {
+				my $target = $_;
+				my $batch_cmd = "";
+				my $batch_0 = 1;
+				foreach (@batch_commands) {
+					chomp;
+					if ($batch_0 == 1) {
+						$batch_cmd = $_;
+						$batch_0 = 0;
+					} else {
+						$batch_cmd = $batch_cmd.";".$_;
+					}
+				}
+				$batch_cmd = "\"".$batch_cmd."\"";
+				$command = join(" ",$thiscmd,$target,$env_path,$batch_cmd);
+				$command =~ s/%DD/$_/g;
+				print "run \"" . $command . "\" on " . $_ ."......\n";
+				system($command);
+			}
+		}
+		if ($?!=0){
+			print "command failed, check the format please!\n";
+		}
+	}
+	exit;
+}
+
+$command = join(" ",$thiscmd,"NODE",$command_string);
+if ($verbose == 1) {
+	print "Run \"" . $command . "\" on:";
+
+	foreach (@hosts){
+		chomp;
+		print " $_";
+	}
+	print ".\n------------------------------OUTPUT------------------------------\n";
+}
+
+
+my $pid_rexec;
+my $index = 0;
+foreach (@hosts){
+	chomp;
+	if ($color_on == 1) {
+		$out_color++;
+		if ($out_color >= 39 ) {
+			$out_color=32;
+		}
+    }
+	if ($_ ne ""){
+		if ($batch_mode == 0) {
+			# This is the most frequently used execution path.
+			$command = join(" ",$thiscmd,$_,$command_string);
+			$command =~ s/%DD/$_/g;
+			$command =~ s/%NN/$children/g;
+			if ($dry_run == 1) {
+				print "$command\n";
+				next;
+			}
+			$pid_rexec = fork;
+			if ($pid_rexec == 0) {
+				if ($color_on == 1) {
+					if ($timing == 1) {
+						open STDERR, "| sed -e 's/^/\033\[31;1m[$_]\033\[0m \/g'";
+						open STDOUT, "| while read HOHO; do echo \"[`date '+%H:%M:%S.%6N'` \033\[$out_color;1m$_\033\[0m] \$HOHO\"; done";
+					}else{
+						open STDERR, "| sed -e 's/^/\033\[31;1m[$_]\033\[0m \/g'";
+						open STDOUT, "| sed -e 's/^/[\033\[$out_color;1m$_\033\[0m] \/g'";
+					}
+				}else{
+					if ($timing == 1) {
+						open STDERR, "| sed -e 's/^/[$_] /g'";
+						open STDOUT, "| while read HOHO; do echo \"[`date '+%H:%M:%S.%6N'` $_] \$HOHO\"; done";
+					}else{
+						open STDERR, "| sed -e 's/^/[$_] /g'";
+						open STDOUT, "| sed -e 's/^/[$_] /g'";
+					}
+                }
+				exec($command);
+			}else{
+				$pids[$children] = $pid_rexec;
+				$pid_host[$children] = $_;
+				$children += 1;
+			}
+		} else {
+			# This is the batch mode execution path.
+			# Commands are fetched from a batch file.
+			my $target = $_;
+			my $batch_cmd = "";
+			my $batch_0 = 1;
+			foreach (@batch_commands) {
+				chomp;
+				if ($batch_0 == 1) {
+					$batch_cmd = $_;
+					$batch_0 = 0;
+				} else {
+					$batch_cmd = $batch_cmd.";".$_;
+				}
+			}
+			$batch_cmd = "\"".$batch_cmd."\"";
+
+			$command = join(" ",$thiscmd,$target,$env_path,$batch_cmd);
+			$command =~ s/%DD/$_/g;
+			$command =~ s/%NN/$children/g;
+			$pid_rexec = fork;
+			if ($pid_rexec == 0) {
+				if ($color_on == 1) {
+					if ($timing == 1) {
+						open STDERR, "| sed -e 's/^/\033\[31;1m[$_]\033\[0m \/g'";
+						open STDOUT, "| while read HOHO; do echo \"[`date '+%H:%M:%S.%6N'` \033\[$out_color;1m$_\033\[0m] \$HOHO\"; done";
+					}else{
+						open STDERR, "| sed -e 's/^/\033\[31;1m[$_]\033\[0m \/g'";
+						open STDOUT, "| sed -e 's/^/[\033\[$out_color;1m$_\033\[0m] \/g'";
+					}
+				}else{
+					if ($timing == 1) {
+						open STDERR, "| sed -e 's/^/[$_] /g'";
+						open STDOUT, "| while read HOHO; do echo \"[`date '+%H:%M:%S.%6N'` $_] \$HOHO\"; done";
+					}else{
+						open STDERR, "| sed -e 's/^/[$_] /g'";
+						open STDOUT, "| sed -e 's/^/[$_] /g'";
+					}
+                }
+				exec($command);
+			}else{
+				$pids[$children] = $pid_rexec;
+				$pid_host[$children] = $_;
+				$children += 1;
+			}
+		}
+	}
+	if ($?!=0){
+		print "Command failed, check the format please!\n";
+	}
+}
+
+print ("$children Children are born.\n") if $verbose;
+
+WAIT_CHILD:
+while (1) {
+	$next_pid = wait;
+	if ($next_pid == -1) {
+		print ("All processes have exited.\n") if $verbose;
+		exit 0;
+	}
+	if ($? != 0) {
+        for(my $i=0;$i<$children;$i++) {
+            if ($pids[$i] == $next_pid) {
+                $wrong_host[$wrong] = $pid_host[$i];
+                $wrong_status[$wrong] = $?>>8;
+                $wrong++;
+            }
+        }
+    }
+	$pids_returned[$returned_no] = $next_pid;
+	print ("processes $next_pid have exited.\n") if $verbose;
+	$returned_no += 1;
+
+	if ($returned_no == $children) {
+        print ("All $children children returned.\n") if $verbose;
+        if ($wrong > 0 && $quiet == 0) {
+            print ("\033\[31;1m*********************** ERROR *************************\033\[0m\n");
+            open(HOSTFILE,">$errornodelist") || print "Can’t open $errornodelist to write.";
+            print HOSTFILE "\#Error Nodes:\n";
+            for(my $i=0;$i<$wrong;$i++) {
+                if ($wrong_status[$i] != 1) {
+                printf("\033\[31;1m[%2d][$wrong_host[$i]]\033\[0m failure code (%d).\n", $i, $wrong_status[$i]);
+                }
+                print HOSTFILE "$wrong_host[$i]\n";
+            }
+            close(HOSTFILE);
+        }
+        # I need a better framework to do cleanup.
+		unlink $thiscmd if ($thiscmdunlink == 1);
+	}
+}
+
+# vi:ts=4:sw=4:readonly:
