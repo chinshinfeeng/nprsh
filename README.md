@@ -3,7 +3,7 @@ an efficient ssh toolkit
 一个高效的工具，可以实现并行ssh连接到多台服务器进行操作，极大地提升效率。
 
 ##USAGE:
-###nprsh [-sN] [-l] [-i] [-c|-C] [-T] [-rackprefix PREFIX -rackscale M.N]
+    nprsh [-sN] [-l] [-i] [-c|-C] [-T] [-rackprefix PREFIX -rackscale M.N]
         [-on NODE_LIST] [-f NODE_LIST_FILE]
         [-F NODE_TABLE [add |remove |-q QUERY_STRING] ]
         [-e EXCLUDED_NODE_LIST] [-x EXCLUDED_NODE_LIST_FILE]
@@ -52,7 +52,7 @@ an efficient ssh toolkit
           Ignore the list of badnodes.
     -X
           Equivalent to "-x /tmp/nprsh_chenzhenfeng.dnlst".
-FUNCTIONS:
+###FUNCTIONS:
     -A USER:PASSWD
            Execute as USER:PASSWD on target nodes.
     -b BATCH_FILE
@@ -99,18 +99,18 @@ FUNCTIONS:
            List host tables created by USER, after START, and before STOP.
     -set field value
            Set the specified property of a list of host.
-MISC:
+###MISC:
     -c     Color off.
     -C     Color on.
     -T     Print the timestamp of each line.
     -q     Be quiet.
     -V     Be verbose/verboser.
-CAUTION:
+###CAUTION:
     In parallel mode (default), the output from each target nodes
     will be messed up randomly.
-EXAMPLES:
+###EXAMPLES:
     nprsh -on g[abc]node004..128 "hostname >/etc/HOSTNAME"
-init
+###init
     nprsh -on anode004..128 -e anode007,anode098 /etc/init.d/sshd start
     nprsh -f oldnodes -x badnodes -f newnodes date
     nprsh -on a118,a119,a130 -U ct test ct123
@@ -119,8 +119,8 @@ init
     nprsh -on [abc]110..159 -t -np 64 xhpl
     nprsh -on a110..159 scp /tmp/netdiag.log node1:/tmp/netdiag_%DD.log
     nprsh -A foo:foo123 CMD
-    nprsh -on m1..32 -X -l scp nprsh.pl @@:/usr/local/bin/nprsh
+    nprsh -on m1..32 -X -l scp nprsh.pl %DD:/usr/local/bin/nprsh
     nprsh -on m19,m28 -c "dmesg |tail" |vi -
-    nprsh -on m1..32 -X -l scp @@:/etc/rc.d/rc.local  rc.local_@@
-    nprsh -on m1..32 -X -l scp slave_etc_hosts.@@ @@:/slave/etc/hosts
+    nprsh -on m1..32 -X -l scp %DD:/etc/rc.d/rc.local  rc.local_%DD
+    nprsh -on m1..32 -X -l scp slave_etc_hosts.%DD %DD:/slave/etc/hosts
     nprsh -on gh10..89 -X -l ssh %DD ifconfig ib0 %DD/g/i/ up
