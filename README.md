@@ -2,14 +2,14 @@
 an efficient ssh toolkit
 一个高效的工具，可以实现并行ssh连接到多台服务器进行操作，极大地提升效率。
 
-USAGE:
-  nprsh [-sN] [-l] [-i] [-c|-C] [-T] [-rackprefix PREFIX -rackscale M.N]
+##USAGE:
+###nprsh [-sN] [-l] [-i] [-c|-C] [-T] [-rackprefix PREFIX -rackscale M.N]
         [-on NODE_LIST] [-f NODE_LIST_FILE]
         [-F NODE_TABLE [add |remove |-q QUERY_STRING] ]
         [-e EXCLUDED_NODE_LIST] [-x EXCLUDED_NODE_LIST_FILE]
         [-E EXCLUDED_NODE_TABLE [-q QUERY_STRING] ]
         <COMMAND |-b BATCH_FILE |-np NUM [-t] MPIAPP |-up |-L |-mpiv>
-TARGET SPECIFICATION:
+###TARGET SPECIFICATION:
     -rackprefix PREFIX -rackscale M.N
           Specify the valid node range, {PREFIX}{*}M..N.
           PREFIX defaults to "gs"
